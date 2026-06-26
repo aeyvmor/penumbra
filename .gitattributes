@@ -1,0 +1,21 @@
+# Normalize line endings: text auto-detected, LF in the repo.
+* text=auto eol=lf
+
+# Windows-specific scripts keep CRLF.
+*.bat   text eol=crlf
+*.cmd   text eol=crlf
+*.ps1   text eol=crlf
+
+# C# / project files
+*.cs    text diff=csharp
+*.csproj text
+*.sln   text eol=crlf
+
+# ---- Binary / Git LFS candidates ----
+# (Run `git lfs install` and `git lfs track` before committing large models.)
+*.onnx  filter=lfs diff=lfs merge=lfs -text
+*.ttf   binary
+*.otf   binary
+*.png   binary
+*.jpg   binary
+*.ico   binary

@@ -1,0 +1,60 @@
+# ---- .NET ----
+bin/
+obj/
+out/
+[Dd]ebug/
+[Rr]elease/
+x64/
+x86/
+*.user
+*.suo
+*.userprefs
+project.lock.json
+artifacts/
+.vs/
+
+# ---- Native / CMake build dirs (legacy prototype) ----
+build/
+
+# ---- Rider / VS Code ----
+.idea/
+*.sln.iml
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.shared.json
+
+# ---- Test / coverage ----
+[Tt]est[Rr]esult*/
+coverage*.json
+coverage*.xml
+*.coverage
+*.trx
+
+# ---- Python (ml/) ----
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+*.egg-info/
+.ipynb_checkpoints/
+ml/data/raw/
+ml/data/cache/
+ml/runs/
+ml/checkpoints/
+wandb/
+
+# ---- Models (large; prefer git-lfs — see .gitattributes) ----
+# Track final shipped models intentionally; ignore scratch exports.
+models/scratch/
+*.pt
+*.ckpt
+
+# ---- OS ----
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ---- Logs / temp ----
+*.log
+*.tmp

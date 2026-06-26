@@ -1,0 +1,16 @@
+<Project>
+  <!-- Solution-wide C# settings. Individual projects inherit these. -->
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <LangVersion>latest</LangVersion>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <!-- Nullability mistakes are bugs: fail the build on them. -->
+    <WarningsAsErrors>nullable</WarningsAsErrors>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <NoWarn>$(NoWarn);CS1591</NoWarn> <!-- don't require XML docs on every public member -->
+    <Authors>Eiv</Authors>
+    <Product>Penumbra</Product>
+    <Company>Penumbra</Company>
+  </PropertyGroup>
+</Project>
