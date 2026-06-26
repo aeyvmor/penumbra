@@ -34,6 +34,7 @@ Requires the **.NET SDK 8.0+**.
 ```bash
 git clone https://github.com/aeyvmor/penumbra.git
 cd penumbra
+dotnet test Penumbra.sln
 dotnet run --project src/Penumbra.App
 ```
 

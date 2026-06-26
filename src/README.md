@@ -1,8 +1,8 @@
 # src/
 
-The .NET solution. **Scaffolded in Phase 0** (see [`../docs/ROADMAP.md`](../docs/ROADMAP.md)) — not yet created.
+The .NET solution. Scaffolded in Phase 0 (see [`../docs/ROADMAP.md`](../docs/ROADMAP.md)).
 
-Planned projects (see [`../docs/ARCHITECTURE.md`](../docs/ARCHITECTURE.md) for detail and dependency rules):
+Projects (see [`../docs/ARCHITECTURE.md`](../docs/ARCHITECTURE.md) for detail and dependency rules):
 
 ```text
 Penumbra.App           Avalonia UI: views, viewmodels (MVVM), DI wiring

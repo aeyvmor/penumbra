@@ -3,6 +3,9 @@
 xUnit test projects, one per engine: `Penumbra.Core.Tests`, `Penumbra.Cas.Tests`,
 `Penumbra.Recognition.Tests`, etc.
 
+The scaffold currently has one smoke test per engine project. Phase work should replace those stubs with
+fixture-driven tests for the actual engine behavior.
+
 Per the **de-risking principle**, every engine's logic core is tested **headless** (no UI) before it gets
 a UI. Priorities:
 

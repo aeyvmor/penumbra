@@ -1,0 +1,37 @@
+<Window xmlns="https://github.com/avaloniaui"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:vm="using:Penumbra.App.ViewModels"
+        xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
+        xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+        mc:Ignorable="d" d:DesignWidth="800" d:DesignHeight="450"
+        x:Class="Penumbra.App.Views.MainWindow"
+        x:DataType="vm:MainWindowViewModel"
+        Width="960"
+        Height="640"
+        MinWidth="640"
+        MinHeight="420"
+        Title="Penumbra">
+
+    <Design.DataContext>
+        <!-- This only sets the DataContext for the previewer in an IDE,
+             to set the actual DataContext for runtime, set the DataContext property in code (look at App.axaml.cs) -->
+        <vm:MainWindowViewModel/>
+    </Design.DataContext>
+
+    <Grid Background="#F8F9FB">
+        <StackPanel HorizontalAlignment="Center"
+                    VerticalAlignment="Center"
+                    Spacing="10">
+            <TextBlock Text="{Binding Greeting}"
+                       HorizontalAlignment="Center"
+                       FontSize="34"
+                       FontWeight="SemiBold"
+                       Foreground="#18202A"/>
+            <TextBlock Text="{Binding Status}"
+                       HorizontalAlignment="Center"
+                       FontSize="14"
+                       Foreground="#5C6673"/>
+        </StackPanel>
+    </Grid>
+
+</Window>
