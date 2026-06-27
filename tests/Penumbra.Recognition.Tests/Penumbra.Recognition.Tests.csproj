@@ -19,6 +19,10 @@
   </ItemGroup>
 
   <ItemGroup>
+    <Content Include="parity_fixture.json" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
+  <ItemGroup>
     <ProjectReference Include="..\..\src\Penumbra.Recognition\Penumbra.Recognition.csproj" />
     <ProjectReference Include="..\..\src\Penumbra.Core\Penumbra.Core.csproj" />
   </ItemGroup>

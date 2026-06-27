@@ -27,11 +27,17 @@ no cloud, no account, everything on your device.
 
 Penumbra is in active early development. Expect rough edges.
 
+**What works today:** handwritten arithmetic. Write a single-line expression ending in `=`
+(e.g. `2+2=`, `21+7=`, `4+1-9=`), press **Recognize**, and the computed answer appears. Recognition
+works best with clearly separated symbols. The handwriting-synthesis, reactive sheet, graphing, and
+tutor features listed above are the roadmap — not built yet.
+
 ## Building
 
-Requires the **.NET SDK 8.0+**.
+Requires the **.NET SDK 8.0+** and **Git LFS** (the recognizer model ships via LFS).
 
 ```bash
+git lfs install
 git clone https://github.com/aeyvmor/penumbra.git
 cd penumbra
 dotnet test Penumbra.sln

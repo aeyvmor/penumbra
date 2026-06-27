@@ -2,8 +2,9 @@
              xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
              x:Class="Penumbra.App.App"
              xmlns:local="using:Penumbra.App"
-             RequestedThemeVariant="Default">
-             <!-- "Default" ThemeVariant follows system theme variant. "Dark" or "Light" are other available options. -->
+             RequestedThemeVariant="Light">
+             <!-- Pinned to Light: the toolbar/canvas use hardcoded light colors, so following a
+                  system Dark variant turns control text white and makes the buttons invisible. -->
 
     <Application.DataTemplates>
         <local:ViewLocator/>

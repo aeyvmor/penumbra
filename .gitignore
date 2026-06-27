@@ -43,6 +43,13 @@ ml/data/cache/
 ml/runs/
 ml/checkpoints/
 wandb/
+# generated/inspection artifacts (regenerable from the scripts)
+ml/data/*_sample.png
+ml/data/all_labels.txt
+ml/data/mnist_sample.png
+ml/train/*_confusion.png
+ml/export/*.onnx
+ml/export/*.onnx.data
 
 # ---- Models (large; prefer git-lfs — see .gitattributes) ----
 # Track final shipped models intentionally; ignore scratch exports.

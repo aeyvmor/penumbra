@@ -1,6 +1,7 @@
 <Window xmlns="https://github.com/avaloniaui"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         xmlns:vm="using:Penumbra.App.ViewModels"
+        xmlns:controls="using:Penumbra.App.Controls"
         xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
         xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
         mc:Ignorable="d" d:DesignWidth="800" d:DesignHeight="450"
@@ -18,20 +19,40 @@
         <vm:MainWindowViewModel/>
     </Design.DataContext>
 
-    <Grid Background="#F8F9FB">
-        <StackPanel HorizontalAlignment="Center"
-                    VerticalAlignment="Center"
-                    Spacing="10">
-            <TextBlock Text="{Binding Greeting}"
-                       HorizontalAlignment="Center"
-                       FontSize="34"
+    <DockPanel>
+        <Border DockPanel.Dock="Top"
+                Background="#FFFFFF"
+                BorderBrush="#E2E6EC"
+                BorderThickness="0,0,0,1"
+                Padding="8,6">
+            <StackPanel Orientation="Horizontal" Spacing="6">
+                <Button Content="Undo" Command="{Binding UndoCommand}"/>
+                <Button Content="Redo" Command="{Binding RedoCommand}"/>
+                <Button Content="Clear" Command="{Binding ClearCommand}"/>
+                <Border Width="1" Background="#E2E6EC" Margin="4,2"/>
+                <Button Content="Recognize" Command="{Binding RecognizeCommand}" FontWeight="SemiBold"/>
+                <Border Width="1" Background="#E2E6EC" Margin="4,2"/>
+                <Button Content="Save" Click="OnSaveClick"/>
+                <Button Content="Open" Click="OnOpenClick"/>
+                <TextBlock Text="Left: draw  ·  Right/Middle: pan  ·  Wheel: zoom"
+                           VerticalAlignment="Center"
+                           Margin="10,0,0,0"
+                           Foreground="#5C6673"/>
+            </StackPanel>
+        </Border>
+
+        <Border DockPanel.Dock="Bottom"
+                Background="#FFFFFF"
+                BorderBrush="#E2E6EC"
+                BorderThickness="0,1,0,0"
+                Padding="12,8">
+            <TextBlock Text="{Binding RecognitionText}"
+                       FontSize="18"
                        FontWeight="SemiBold"
                        Foreground="#18202A"/>
-            <TextBlock Text="{Binding Status}"
-                       HorizontalAlignment="Center"
-                       FontSize="14"
-                       Foreground="#5C6673"/>
-        </StackPanel>
-    </Grid>
+        </Border>
+
+        <controls:InkCanvasControl Document="{Binding Document}"/>
+    </DockPanel>
 
 </Window>

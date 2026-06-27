@@ -13,9 +13,11 @@ public static class ServiceCollectionExtensions
     /// <summary>Adds Penumbra services to the dependency-injection container.</summary>
     public static IServiceCollection AddPenumbraApp(this IServiceCollection services)
     {
-        services.AddSingleton<IStrokeSmoother, PassthroughStrokeSmoother>();
-        services.AddSingleton<IRecognizer, NoOpRecognizer>();
-        services.AddSingleton<IEvaluator, StubEvaluator>();
+        services.AddSingleton<IStrokeSmoother, ChaikinStrokeSmoother>();
+        services.AddSingleton<IStrokeSegmenter, OverlapStrokeSegmenter>();
+        services.AddSingleton<ISymbolClassifier, OnnxSymbolClassifier>();
+        services.AddSingleton<IRecognizer, ExpressionRecognizer>();
+        services.AddSingleton<IEvaluator, AngouriMathEvaluator>();
         services.AddSingleton<IGraphDetector, NoOpGraphDetector>();
         services.AddTransient<MainWindowViewModel>();
 

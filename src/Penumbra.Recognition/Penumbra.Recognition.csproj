@@ -1,4 +1,4 @@
-﻿<Project Sdk="Microsoft.NET.Sdk">
+<Project Sdk="Microsoft.NET.Sdk">
 
   <ItemGroup>
     <ProjectReference Include="..\Penumbra.Core\Penumbra.Core.csproj" />
@@ -9,5 +9,16 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
   </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.ML.OnnxRuntime" Version="1.20.1" />
+  </ItemGroup>
+
+  <!-- The R1 model + its preprocessing contract; copied next to the app so the
+       recognizer can load them at runtime (and into projects referencing this one). -->
+  <ItemGroup>
+    <Content Include="Models\crohme_geo_cnn.onnx" CopyToOutputDirectory="PreserveNewest" />
+    <Content Include="Models\crohme_geo_cnn.meta.json" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
 
 </Project>
