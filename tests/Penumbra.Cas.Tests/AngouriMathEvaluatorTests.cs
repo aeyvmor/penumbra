@@ -159,6 +159,30 @@ public sealed class AngouriMathEvaluatorTests
     }
 
     [Fact]
+    public void EvaluatesInsideSizedDelimiters()
+    {
+        // 3.9f: \left( ... \right) must evaluate exactly like plain parens — here (2+3)= is 5.
+        var result = Eval(@"\left(2+3\right)=");
+
+        Assert.True(result.IsComputed);
+        Assert.Equal(EvaluationKind.Number, result.Kind);
+        Assert.Equal("5", result.DisplayText);
+    }
+
+    [Fact]
+    public void PlusMinusIsRejectedNotSilentlyAnswered()
+    {
+        // 3.9f: "2 \pm 3" has two answers (5 and -1); the evaluator must surface a graceful Error
+        // rather than the silent single-branch "5" that dropping the minus branch would give.
+        var result = Eval(@"2\pm 3=");
+
+        Assert.False(result.IsComputed);
+        Assert.Equal(EvaluationKind.Error, result.Kind);
+        Assert.NotEqual("5", result.DisplayText);
+        Assert.Contains("pm", result.DisplayText);
+    }
+
+    [Fact]
     public void MalformedInputFailsGracefully()
     {
         var result = Eval("garbage^^^");

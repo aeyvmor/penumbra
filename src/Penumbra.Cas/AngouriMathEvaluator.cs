@@ -23,14 +23,16 @@ public sealed class AngouriMathEvaluator : IEvaluator
     {
         ArgumentNullException.ThrowIfNull(request);
 
-        var translated = LatexToAngouriMath.Translate(request.Latex);
-        if (string.IsNullOrWhiteSpace(translated))
-        {
-            return Error("Nothing to evaluate.");
-        }
-
         try
         {
+            // Translation runs inside the guard so a rejected construct (e.g. \pm throwing
+            // NotSupportedException) surfaces as a graceful Error, honouring "never throws to callers".
+            var translated = LatexToAngouriMath.Translate(request.Latex);
+            if (string.IsNullOrWhiteSpace(translated))
+            {
+                return Error("Nothing to evaluate.");
+            }
+
             var (left, right, hasEquals) = SplitEquation(translated);
 
             // "lhs = rhs" with a real right-hand side is an equation to solve; a bare trailing

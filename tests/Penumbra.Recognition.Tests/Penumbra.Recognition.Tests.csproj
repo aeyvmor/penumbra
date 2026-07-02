@@ -24,6 +24,7 @@
 
   <ItemGroup>
     <ProjectReference Include="..\..\src\Penumbra.Recognition\Penumbra.Recognition.csproj" />
+    <ProjectReference Include="..\..\src\Penumbra.Cas\Penumbra.Cas.csproj" />
     <ProjectReference Include="..\..\src\Penumbra.Core\Penumbra.Core.csproj" />
   </ItemGroup>
 

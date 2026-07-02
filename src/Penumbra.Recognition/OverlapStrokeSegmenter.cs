@@ -23,7 +23,17 @@ public sealed class OverlapStrokeSegmenter : IStrokeSegmenter
     /// the reference symbol size. Kept small so adjacent symbols stay apart.</param>
     /// <param name="verticalGapFactor">Largest vertical gap that still merges, as a fraction of the
     /// reference symbol size. Kept larger so a symbol's stacked strokes stay together.</param>
-    public OverlapStrokeSegmenter(double horizontalGapFactor = 0.4, double verticalGapFactor = 1.2)
+    // 3.9g: retuned down from 0.4 / 1.2 after dogfooding on large mouse ink (~150-190px symbols),
+    // where the old radii (a 60-75px horizontal swallow, wider than real inter-symbol spacing)
+    // chain-merged SEPARATE symbols into one blob that the CNN then confidently mislabelled
+    // ('5-1=' read as '5=', '27' read as '2'). Genuine same-symbol strokes barely need a horizontal
+    // window: the cross of a '+', the arms of an '=' / '÷', the bar+stem of 4/5/7 all overlap or
+    // touch in x (dx≈0), so gapX only has to absorb sloppy near-misses, not bridge the space between
+    // symbols. Vertically, a symbol's own stacked strokes (the two bars of '=', a '÷' dot over its
+    // bar) sit within ~0.5x the symbol size, so 0.6 covers them while staying below line spacing —
+    // and, crucially, below the vertical distance from an operator to a digit on the same line, so a
+    // '+' whose bar happens to overlap a neighbouring '7' in x no longer swallows it.
+    public OverlapStrokeSegmenter(double horizontalGapFactor = 0.1, double verticalGapFactor = 0.6)
     {
         _horizontalGapFactor = horizontalGapFactor;
         _verticalGapFactor = verticalGapFactor;

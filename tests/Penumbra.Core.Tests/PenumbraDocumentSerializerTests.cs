@@ -92,4 +92,61 @@ public sealed class PenumbraDocumentSerializerTests
     {
         Assert.ThrowsAny<Exception>(() => PenumbraDocumentSerializer.Deserialize("not json"));
     }
+
+    [Fact]
+    public void PreservesRawSamplesExactly()
+    {
+        // A v2 document stores raw pen data; the serializer must not alter a single coordinate.
+        var stroke = new Stroke(Guid.NewGuid(), new[]
+        {
+            new StrokeSample(1.2345678, -9.8765432, TimeSpan.FromTicks(12345), 0.123456),
+            new StrokeSample(100.5, 200.25, TimeSpan.FromMilliseconds(33), 0.999999),
+            new StrokeSample(0, 0, TimeSpan.FromSeconds(2), 0),
+        });
+        var original = new PenumbraDocument(
+            new[] { stroke }, Array.Empty<ExpressionNode>(),
+            new Dictionary<string, string>(), PenumbraDocumentSerializer.SchemaVersion);
+
+        PenumbraDocument result = PenumbraDocumentSerializer.Deserialize(
+            PenumbraDocumentSerializer.Serialize(original));
+
+        Assert.True(stroke.Samples.SequenceEqual(result.Strokes[0].Samples));
+    }
+
+    [Fact]
+    public void SchemaVersionIsTwo()
+    {
+        Assert.Equal(2, PenumbraDocumentSerializer.SchemaVersion);
+    }
+
+    [Fact]
+    public void LoadsVersion1Json()
+    {
+        // A pre-3.9e v1 file (strokes were stored smoothed). It must still load, keeping Version = 1.
+        const string v1Json = """
+        {
+          "Strokes": [
+            {
+              "Id": "11111111-1111-1111-1111-111111111111",
+              "Samples": [
+                { "X": 0, "Y": 0, "Time": "00:00:00", "Pressure": 0.4 },
+                { "X": 3.5, "Y": -1.25, "Time": "00:00:00.0160000", "Pressure": 0.8 }
+              ]
+            }
+          ],
+          "Expressions": [],
+          "Variables": { "x": "5" },
+          "Version": 1
+        }
+        """;
+
+        PenumbraDocument doc = PenumbraDocumentSerializer.Deserialize(v1Json);
+
+        Assert.Equal(1, doc.Version); // loaded as-is, not migrated
+        Assert.Single(doc.Strokes);
+        Assert.Equal(Guid.Parse("11111111-1111-1111-1111-111111111111"), doc.Strokes[0].Id);
+        Assert.Equal(2, doc.Strokes[0].Samples.Count);
+        Assert.Equal(new StrokeSample(3.5, -1.25, TimeSpan.FromMilliseconds(16), 0.8), doc.Strokes[0].Samples[1]);
+        Assert.Equal("5", doc.Variables["x"]);
+    }
 }

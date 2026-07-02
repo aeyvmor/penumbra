@@ -6,11 +6,25 @@ namespace Penumbra.Core;
 /// Reads and writes <see cref="PenumbraDocument"/> as JSON — the on-disk <c>.pen</c> format. Kept here in
 /// Core (alongside the document model, with no UI dependency) so persistence can be unit-tested headless.
 /// The document's own <see cref="PenumbraDocument.Version"/> carries the schema version for future migration.
+/// <para>
+/// Schema history:
+/// <list type="bullet">
+///   <item><description><b>v1</b> — <see cref="Stroke.Samples"/> held the <em>smoothed</em> polyline
+///   (the canvas smoothed before storing). v1 files still load as-is; their strokes stay smoothed, which
+///   is acceptable for display but is why they are not first-class corpus/recognizer parity material.</description></item>
+///   <item><description><b>v2</b> — <see cref="Stroke.Samples"/> holds the <em>raw</em> pen data as
+///   captured; smoothing moved to render time. No field changed shape — v2 is purely a semantic change of
+///   what <c>Samples</c> means. Loading a v1 file leaves its <c>Version</c> at 1 (no in-place migration).</description></item>
+/// </list>
+/// </para>
 /// </summary>
 public static class PenumbraDocumentSerializer
 {
-    /// <summary>Current on-disk schema version. Bump when the persisted shape changes incompatibly.</summary>
-    public const int SchemaVersion = 1;
+    /// <summary>
+    /// Current on-disk schema version. Bump when the persisted shape or meaning changes incompatibly.
+    /// v2: <see cref="Stroke.Samples"/> is raw pen data (v1 stored smoothed). See the type summary.
+    /// </summary>
+    public const int SchemaVersion = 2;
 
     private static readonly JsonSerializerOptions Options = new()
     {

@@ -25,7 +25,10 @@ public sealed class InkCanvasControl : Control
 
     private readonly Stopwatch _clock = Stopwatch.StartNew();
     private readonly StrokeWidthModel _widthModel = new();
-    private readonly IStrokeSmoother _smoother = new ChaikinStrokeSmoother();
+
+    // The document stores raw pen data (for recognizer/glyph-bank parity). Smoothing is display-only and
+    // happens here at render time, cached per stroke id so we don't re-smooth every frame.
+    private readonly SmoothedStrokeCache _smoothCache = new(new ChaikinStrokeSmoother());
 
     // World→screen view transform: screen = world * scale + offset.
     private double _scale = 1.0;
@@ -93,8 +96,12 @@ public sealed class InkCanvasControl : Control
             {
                 foreach (Stroke stroke in doc.Strokes)
                 {
-                    DrawStroke(context, stroke);
+                    // Strokes are stored raw; draw the smoothed form (cached per id).
+                    DrawStroke(context, _smoothCache.GetSmoothed(stroke));
                 }
+
+                // Bound the cache: forget strokes that are no longer present (cleared/undone).
+                _smoothCache.EvictMissing(doc.Strokes.Select(s => s.Id));
             }
 
             // The in-progress stroke is drawn raw (un-smoothed) for immediate feedback.
@@ -225,8 +232,9 @@ public sealed class InkCanvasControl : Control
         {
             if (_activeSamples.Count > 0)
             {
-                var raw = new Stroke(Guid.NewGuid(), _activeSamples);
-                Document?.AddStroke(_smoother.Smooth(raw));
+                // Store the raw stroke. The recognizer and glyph bank consume Document.Strokes, so they
+                // get the pen data as captured; the canvas smooths only for display (see _smoothCache).
+                Document?.AddStroke(new Stroke(Guid.NewGuid(), _activeSamples));
             }
 
             _activeSamples = null;

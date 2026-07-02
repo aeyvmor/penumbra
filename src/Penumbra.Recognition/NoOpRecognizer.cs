@@ -13,6 +13,7 @@ public sealed class NoOpRecognizer : IRecognizer
         return new RecognitionResult(
             Latex: string.Empty,
             Tokens: Array.Empty<RecognizedToken>(),
-            Confidence: 0);
+            Confidence: 0,
+            MinConfidence: 0);
     }
 }

@@ -238,7 +238,15 @@ public static class LatexToAngouriMath
                 return ReadDelimited(scanner, '(', ')');
 
             case '\\':
-                return TranslateCommand(scanner).Text;
+            {
+                CommandToken command = TranslateCommand(scanner);
+
+                // \left / \right (and spacing commands like "\,") tokenize as Empty — they only
+                // decorate the delimiter that follows, carrying no atom of their own. Skip them and
+                // read the atom they wrap, so \sin\left(x\right) reads its argument as "x" rather
+                // than an empty group (which produced the "sin()*(x)" bug).
+                return command.IsEmpty ? ReadAtom(scanner) : command.Text;
+            }
 
             default:
                 if (char.IsDigit(c) || c == '.')
@@ -359,7 +367,12 @@ public static class LatexToAngouriMath
                 return CommandToken.Operator("/");
 
             case "pm":
-                return CommandToken.Operator("+");
+                // Rejected on purpose: "a \pm b" denotes two answers (a+b and a-b). Emitting only
+                // "+" would silently drop the minus branch (a wrong single answer); translating both
+                // branches is out of scope until the solver returns solution sets. \pm is one of the
+                // 39 recognizer classes, so it can arrive from real ink — fail loudly, not silently.
+                throw new NotSupportedException(
+                    @"\pm is not supported yet (both-branch solutions arrive with a later phase).");
 
             case "leq" or "le":
                 return CommandToken.Operator("<=");

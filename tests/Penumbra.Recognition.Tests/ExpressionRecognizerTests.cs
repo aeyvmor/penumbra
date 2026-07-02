@@ -80,6 +80,19 @@ public sealed class ExpressionRecognizerTests
 
         // Result confidence is the mean of the per-symbol confidences.
         Assert.Equal((0.8 + 0.9 + 0.7 + 0.6) / 4, result.Confidence, 3);
+
+        // 3.9c: MinConfidence is the weakest symbol — here the last one (0.6).
+        Assert.Equal(0.6, result.MinConfidence, 3);
+    }
+
+    [Fact]
+    public void EmptyInput_MinConfidenceIsZero()
+    {
+        var recognizer = new ExpressionRecognizer(new OverlapStrokeSegmenter(), new FakeClassifier(_ => "x"));
+
+        RecognitionResult result = recognizer.Recognize(Array.Empty<Stroke>());
+
+        Assert.Equal(0, result.MinConfidence);
     }
 
     [Fact]

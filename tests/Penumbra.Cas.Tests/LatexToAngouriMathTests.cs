@@ -49,6 +49,10 @@ public sealed class LatexToAngouriMathTests
     [InlineData(@"\alpha+\beta", "alpha+beta")]
     [InlineData("|x|", "abs(x)")]
     [InlineData(@"\left(x+1\right)", "(x+1)")]
+    // 3.9f: \left / \right decorate the delimiter; a function must read past them to its argument.
+    [InlineData(@"\sin\left(x\right)", "sin(x)")]
+    [InlineData(@"\cos\left(2x\right)", "cos(2*x)")]
+    [InlineData(@"\left(\left(x\right)\right)", "((x))")]
     // subscripts fold into the variable name
     [InlineData("x_1", "x1")]
     [InlineData("v_{0}", "v0")]
@@ -74,5 +78,15 @@ public sealed class LatexToAngouriMathTests
     {
         // \frac{\frac{1}{2}}{3} → (( ((1)/(2)) )/(3))
         Assert.Equal("((((1)/(2)))/(3))", LatexToAngouriMath.Translate(@"\frac{\frac{1}{2}}{3}"));
+    }
+
+    [Fact]
+    public void PlusMinusIsRejectedRatherThanSilentlyDroppingABranch()
+    {
+        // 3.9f: "a \pm b" is two answers; emitting only "+" would be a silent wrong single answer.
+        // Reject loudly instead — \pm is a recognizer class, so it can arrive from real ink.
+        var ex = Assert.Throws<NotSupportedException>(() => LatexToAngouriMath.Translate(@"2\pm 3="));
+
+        Assert.Contains("pm", ex.Message);
     }
 }
