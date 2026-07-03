@@ -4,6 +4,12 @@
     <ProjectReference Include="..\Penumbra.Core\Penumbra.Core.csproj" />
   </ItemGroup>
 
+  <ItemGroup>
+    <!-- Headless glyph-outline tracing for the cold-start font fallback (Phase 4e). Pinned to the same
+         SkiaSharp version Avalonia already brings transitively into the App, so there is one Skia on disk. -->
+    <PackageReference Include="SkiaSharp" Version="3.119.4" />
+  </ItemGroup>
+
   <PropertyGroup>
     <TargetFramework>net8.0</TargetFramework>
     <ImplicitUsings>enable</ImplicitUsings>

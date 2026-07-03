@@ -3,6 +3,7 @@ using Penumbra.App.ViewModels;
 using Penumbra.Cas;
 using Penumbra.Core;
 using Penumbra.Graphing;
+using Penumbra.Ink;
 using Penumbra.Recognition;
 
 namespace Penumbra.App.Services;
@@ -24,6 +25,33 @@ public static class ServiceCollectionExtensions
             Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
             "Penumbra",
             "glyphbank.json")));
+
+        // Phase 4d/4e: synthesize the answer in the user's own hand. The source chain is the user's bank first,
+        // then the Caveat cold-start font fallback — the user's hand always wins, the font only fills gaps. As
+        // the bank fills, the font is consulted less: that IS the M2 crossfade. An absent bank/font just yields
+        // a shorter chain rather than throwing — the app still runs, animation just degrades.
+        services.AddSingleton(sp =>
+        {
+            var sources = new List<IGlyphSource>();
+            if (sp.GetService<IGlyphBank>() is { } bank)
+            {
+                sources.Add(new BankGlyphSource(bank));
+            }
+
+            // Font is copied next to the app (see csproj). If it is missing/corrupt, skip the source — cold-start
+            // fallback is off but the app must not crash.
+            string fontPath = Path.Combine(AppContext.BaseDirectory, "assets", "Caveat-VariableFont_wght.ttf");
+            try
+            {
+                sources.Add(new CaveatGlyphSource(fontPath));
+            }
+            catch (Exception)
+            {
+                // Degrade gracefully: no cold-start glyphs, but the bank chain and the rest of the app still work.
+            }
+
+            return new HandwritingSynthesizer(sources);
+        });
 
         services.AddTransient<MainWindowViewModel>();
 

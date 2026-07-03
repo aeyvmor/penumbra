@@ -64,6 +64,45 @@ public sealed class JsonGlyphBank : IGlyphBank
         }
     }
 
+    /// <inheritdoc />
+    public GlyphSample? Sample(string symbol, Random random)
+    {
+        ArgumentNullException.ThrowIfNull(symbol);
+        ArgumentNullException.ThrowIfNull(random);
+
+        GlyphSample[] snapshot;
+        lock (_gate)
+        {
+            if (!_bySymbol.TryGetValue(symbol, out List<GlyphSample>? samples) || samples.Count == 0)
+            {
+                return null;
+            }
+
+            // Snapshot under the gate, then run the weighted draw outside it: the caller-shared Random must
+            // not be exercised while holding the lock, and the store must not mutate mid-draw.
+            snapshot = samples.ToArray();
+        }
+
+        // Linear recency weighting: exemplars are stored oldest-first, so index i (0-based) gets weight i+1.
+        // The newest exemplar (weight N) is therefore N times as likely as the oldest (weight 1) while every
+        // exemplar keeps a nonzero chance. Total weight = N(N+1)/2.
+        int n = snapshot.Length;
+        long totalWeight = (long)n * (n + 1) / 2;
+        double target = random.NextDouble() * totalWeight;
+
+        long cumulative = 0;
+        for (int i = 0; i < n; i++)
+        {
+            cumulative += i + 1;
+            if (target < cumulative)
+            {
+                return snapshot[i];
+            }
+        }
+
+        return snapshot[n - 1]; // guard: floating-point could land target exactly on totalWeight
+    }
+
     private void Save()
     {
         string? directory = Path.GetDirectoryName(_storePath);

@@ -12,6 +12,14 @@
   </ItemGroup>
 
   <ItemGroup>
+    <!-- Phase 4e cold-start font: copy the repo-root Caveat asset next to the app so CaveatGlyphSource can
+         resolve it via AppContext.BaseDirectory at runtime. Link keeps it out of the project's Assets tree. -->
+    <None Include="..\..\assets\Caveat-VariableFont_wght.ttf" Link="assets\Caveat-VariableFont_wght.ttf">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
+  </ItemGroup>
+
+  <ItemGroup>
     <PackageReference Include="Avalonia" Version="12.0.5" />
     <PackageReference Include="Avalonia.Desktop" Version="12.0.5" />
     <PackageReference Include="Avalonia.Themes.Fluent" Version="12.0.5" />

@@ -4,6 +4,8 @@ using Avalonia.Controls;
 using Avalonia.Input;
 using Avalonia.Media;
 using Avalonia.Media.Immutable;
+using Avalonia.Threading;
+using Avalonia.VisualTree;
 using Penumbra.Core;
 using Penumbra.Ink;
 
@@ -20,11 +22,27 @@ public sealed class InkCanvasControl : Control
     public static readonly StyledProperty<InkDocument?> DocumentProperty =
         AvaloniaProperty.Register<InkCanvasControl, InkDocument?>(nameof(Document));
 
+    public static readonly StyledProperty<AnswerAnimation?> AnswerAnimationProperty =
+        AvaloniaProperty.Register<InkCanvasControl, AnswerAnimation?>(nameof(AnswerAnimation));
+
+    // Wall-clock → animation-time multiplier. Captured pen pace can feel sluggish; bump this to speed up the
+    // "write-itself" playback. One named knob so tuning later is a single-line change.
+    private const double PlaybackSpeed = 1.0;
+
+    // Repaint cadence while an answer animates (~60 fps).
+    private static readonly TimeSpan FrameInterval = TimeSpan.FromMilliseconds(16);
+
     private static readonly IImmutableSolidColorBrush PaperBrush = new ImmutableSolidColorBrush(Color.FromRgb(0xF8, 0xF9, 0xFB));
     private static readonly IImmutableSolidColorBrush InkBrush = new ImmutableSolidColorBrush(Color.FromRgb(0x18, 0x20, 0x2A));
 
     private readonly Stopwatch _clock = Stopwatch.StartNew();
     private readonly StrokeWidthModel _widthModel = new();
+
+    // The currently-playing answer layer (rendered on top of the document ink, never folded into it), the
+    // wall-clock instant playback began, and the ticking repaint timer (null when idle or finished).
+    private SynthesizedHandwriting? _answer;
+    private TimeSpan _answerStart;
+    private DispatcherTimer? _answerTimer;
 
     // The document stores raw pen data (for recognizer/glyph-bank parity). Smoothing is display-only and
     // happens here at render time, cached per stroke id so we don't re-smooth every frame.
@@ -56,28 +74,92 @@ public sealed class InkCanvasControl : Control
         set => SetValue(DocumentProperty, value);
     }
 
+    /// <summary>The answer layer to play on top of the ink, or null for none. Set by the view-model on Recognize.</summary>
+    public AnswerAnimation? AnswerAnimation
+    {
+        get => GetValue(AnswerAnimationProperty);
+        set => SetValue(AnswerAnimationProperty, value);
+    }
+
     protected override void OnPropertyChanged(AvaloniaPropertyChangedEventArgs change)
     {
         base.OnPropertyChanged(change);
-        if (change.Property != DocumentProperty)
+
+        if (change.Property == DocumentProperty)
+        {
+            if (change.OldValue is InkDocument oldDoc)
+            {
+                oldDoc.Changed -= OnDocumentChanged;
+            }
+
+            if (change.NewValue is InkDocument newDoc)
+            {
+                newDoc.Changed += OnDocumentChanged;
+            }
+
+            InvalidateVisual();
+        }
+        else if (change.Property == AnswerAnimationProperty)
+        {
+            OnAnswerAnimationChanged(change.NewValue as AnswerAnimation);
+        }
+    }
+
+    private void OnDocumentChanged(object? sender, EventArgs e) => InvalidateVisual();
+
+    // --- Answer animation ------------------------------------------------------------------------
+
+    private void OnAnswerAnimationChanged(AnswerAnimation? animation)
+    {
+        // Always stop the previous run first so replacing an animation never leaks a running timer.
+        StopAnswerTimer();
+
+        _answer = animation?.Handwriting;
+        if (_answer is null)
+        {
+            InvalidateVisual();
+            return;
+        }
+
+        // Anchor playback to "now"; Render maps elapsed wall-clock (× speed) onto the timeline.
+        _answerStart = _clock.Elapsed;
+        _answerTimer = new DispatcherTimer { Interval = FrameInterval };
+        _answerTimer.Tick += OnAnswerTick;
+        _answerTimer.Start();
+        InvalidateVisual();
+    }
+
+    private void OnAnswerTick(object? sender, EventArgs e)
+    {
+        InvalidateVisual();
+
+        // Once the whole timeline has played, stop ticking but KEEP _answer so Render holds the final frame
+        // (SampleAt clamps past TotalDuration), leaving the finished answer on the page.
+        if (_answer is null || AnswerElapsed() >= _answer.Timeline.TotalDuration)
+        {
+            StopAnswerTimer();
+        }
+    }
+
+    private TimeSpan AnswerElapsed() => (_clock.Elapsed - _answerStart) * PlaybackSpeed;
+
+    private void StopAnswerTimer()
+    {
+        if (_answerTimer is null)
         {
             return;
         }
 
-        if (change.OldValue is InkDocument oldDoc)
-        {
-            oldDoc.Changed -= OnDocumentChanged;
-        }
-
-        if (change.NewValue is InkDocument newDoc)
-        {
-            newDoc.Changed += OnDocumentChanged;
-        }
-
-        InvalidateVisual();
+        _answerTimer.Stop();
+        _answerTimer.Tick -= OnAnswerTick;
+        _answerTimer = null;
     }
 
-    private void OnDocumentChanged(object? sender, EventArgs e) => InvalidateVisual();
+    protected override void OnDetachedFromVisualTree(VisualTreeAttachmentEventArgs e)
+    {
+        base.OnDetachedFromVisualTree(e);
+        StopAnswerTimer();   // don't leave a timer running against a detached control.
+    }
 
     // --- Rendering -------------------------------------------------------------------------------
 
@@ -108,6 +190,17 @@ public sealed class InkCanvasControl : Control
             if (_activeSamples is { Count: > 0 })
             {
                 DrawStroke(context, new Stroke(Guid.Empty, _activeSamples));
+            }
+
+            // The answer layer: replay the timeline up to the current instant, on top of the document ink and
+            // in the SAME world transform (the synthesizer anchored these strokes at the '=' world bounds).
+            // Reusing DrawStroke gives the answer the identical pressure/velocity width model as real ink.
+            if (_answer is not null)
+            {
+                foreach (Stroke stroke in _answer.Timeline.SampleAt(AnswerElapsed()))
+                {
+                    DrawStroke(context, stroke);
+                }
             }
         }
     }
