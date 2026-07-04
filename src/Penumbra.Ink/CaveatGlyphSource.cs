@@ -4,21 +4,21 @@ using SkiaSharp;
 namespace Penumbra.Ink;
 
 /// <summary>
-/// Cold-start <see cref="IGlyphSource"/> that traces a handwriting font's glyph outlines into strokes when
-/// the user's own bank lacks a symbol — so M2 animates from day one with zero captured glyphs. The typeface
-/// is parsed once and extracted glyphs are cached (the font never changes at runtime), so the source is
-/// deterministic and <c>random</c> is unused (that is part of the <see cref="IGlyphSource"/> seam contract).
-/// Known M2 limitation: this traces the glyph's CONTOUR (its filled outline), not a centerline skeleton —
-/// good enough for cold-start; centerline extraction is future polish.
+/// Cold-start <see cref="IGlyphSource"/> that extracts a handwriting font's glyphs as CENTERLINE strokes
+/// (via <see cref="GlyphSkeletonizer"/>) when the user's own bank lacks a symbol — so M2 animates from day
+/// one with zero captured glyphs, and font glyphs draw as single pen lines like real handwriting rather
+/// than hollow outline contours. The typeface is parsed once and extracted glyphs are cached (the font
+/// never changes at runtime), so the source is deterministic and <c>random</c> is unused (that is part of
+/// the <see cref="IGlyphSource"/> seam contract).
+/// Known M2 limitation: the skeleton is a geometric centerline, not a reconstruction of the calligrapher's
+/// pen order — stroke count and direction are heuristic (top-left-most stroke first, top-down within one).
 /// </summary>
 public sealed class CaveatGlyphSource : IGlyphSource
 {
     // A fixed reference em size to extract outlines at; the exact value is irrelevant because every glyph is
-    // re-normalized to the unit em-box afterward, but a larger size gives the path measurer more resolution.
-    private const float ReferenceSize = 100f;
-
-    // Contour sampling step (~2% of the reference size): dense enough to trace curves, sparse enough to stay cheap.
-    private const float SampleStep = ReferenceSize * 0.02f;
+    // re-normalized to the unit em-box afterward, but a larger size gives the raster skeletonizer more
+    // resolution (it rasterizes the glyph path 1:1 within its size cap).
+    private const float ReferenceSize = 180f;
 
     // Constant mid pressure — font ink carries no captured pen force.
     private const float GlyphPressure = 0.6f;
@@ -72,7 +72,7 @@ public sealed class CaveatGlyphSource : IGlyphSource
         }
     }
 
-    /// <summary>Traces the glyph outline for <paramref name="symbol"/> into em-box strokes, or null on any miss.</summary>
+    /// <summary>Extracts the glyph's centerline for <paramref name="symbol"/> into em-box strokes, or null on any miss.</summary>
     private IReadOnlyList<Stroke>? Extract(string symbol)
     {
         if (!TryMapChar(symbol, out char ch))
@@ -96,44 +96,44 @@ public sealed class CaveatGlyphSource : IGlyphSource
             return null;
         }
 
+        IReadOnlyList<IReadOnlyList<SKPoint>> polylines = GlyphSkeletonizer.Skeletonize(path);
+
         var strokes = new List<Stroke>();
-        using (var measure = new SKPathMeasure(path, forceClosed: false))
+        foreach (IReadOnlyList<SKPoint> polyline in polylines)
         {
-            do
+            if (polyline.Count == 0)
             {
-                float length = measure.Length;
-                if (length <= 0f)
-                {
-                    continue; // degenerate contour (e.g. a stray move) — no ink.
-                }
-
-                var samples = new List<StrokeSample>();
-                for (float d = 0f; d < length; d += SampleStep)
-                {
-                    if (measure.GetPosition(d, out SKPoint p))
-                    {
-                        samples.Add(new StrokeSample(p.X, p.Y, TimeSpan.Zero, GlyphPressure));
-                    }
-                }
-
-                // Always close the contour on its final point so the traced outline meets itself.
-                if (measure.GetPosition(length, out SKPoint end))
-                {
-                    samples.Add(new StrokeSample(end.X, end.Y, TimeSpan.Zero, GlyphPressure));
-                }
-
-                if (samples.Count > 0)
-                {
-                    strokes.Add(new Stroke(Guid.NewGuid(), samples));
-                }
+                continue;
             }
-            while (measure.NextContour());
+
+            // Times stay zero on every sample: font ink is paceless by contract — the synthesizer re-times
+            // strokes by arc length downstream.
+            var samples = new StrokeSample[polyline.Count];
+            for (int i = 0; i < polyline.Count; i++)
+            {
+                samples[i] = new StrokeSample(polyline[i].X, polyline[i].Y, TimeSpan.Zero, GlyphPressure);
+            }
+
+            // Orient each stroke to start at its top-left-most end — approximates natural pen direction.
+            if ((samples[^1].Y, samples[^1].X).CompareTo((samples[0].Y, samples[0].X)) < 0)
+            {
+                Array.Reverse(samples);
+            }
+
+            strokes.Add(new Stroke(Guid.NewGuid(), samples));
         }
 
         if (strokes.Count == 0)
         {
             return null;
         }
+
+        // Draw strokes in an approximate natural writing order: top-left-ish first.
+        strokes.Sort((a, b) =>
+        {
+            int byY = a.Samples[0].Y.CompareTo(b.Samples[0].Y);
+            return byY != 0 ? byY : a.Samples[0].X.CompareTo(b.Samples[0].X);
+        });
 
         // Per-glyph em-box normalization matches the bank source's contract, so sizing stays consistent when
         // an answer mixes bank glyphs and font glyphs.

@@ -24,6 +24,13 @@ public sealed class BankGlyphSource : IGlyphSource
         ArgumentNullException.ThrowIfNull(symbol);
         ArgumentNullException.ThrowIfNull(random);
 
+        // The bank may hold this symbol as raw corpus (ADR-0006), but only synthesis-trusted symbols are ever
+        // served — junk letters banked before the whitelist existed fall through to the Caveat font instead.
+        if (!GlyphBankPolicy.IsBankable(symbol))
+        {
+            return null;
+        }
+
         GlyphSample? sample = _bank.Sample(symbol, random);
         return sample is null ? null : GlyphNormalizer.ToEmBox(sample.Strokes);
     }

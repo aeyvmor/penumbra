@@ -52,6 +52,31 @@ public sealed class BankGlyphSourceTests
     }
 
     [Fact]
+    public void ReturnsNullForBankedButNonSynthesisTrustedLetter()
+    {
+        // Junk letters banked before the whitelist existed (a mislabelled "y", or "x" itself) live in the real
+        // corpus but must never be served: the source returns null so synthesis falls through to Caveat.
+        string dir = Path.Combine(Path.GetTempPath(), "penumbra-bankglyph-" + Guid.NewGuid().ToString("N"));
+        try
+        {
+            var bank = new JsonGlyphBank(Path.Combine(dir, "glyphs.json"));
+            bank.Capture(new GlyphSample("y", new[] { RawStroke((100, 200), (140, 260)) }, DateTimeOffset.UtcNow));
+            bank.Capture(new GlyphSample("x", new[] { RawStroke((100, 200), (140, 260)) }, DateTimeOffset.UtcNow));
+
+            var source = new BankGlyphSource(bank);
+            Assert.Null(source.GetGlyph("y", new Random(1)));   // not synthesis-trusted → null
+            Assert.Null(source.GetGlyph("x", new Random(1)));   // "x" dropped from the policy set
+        }
+        finally
+        {
+            if (Directory.Exists(dir))
+            {
+                Directory.Delete(dir, recursive: true);
+            }
+        }
+    }
+
+    [Fact]
     public void ReturnsNullForUnknownSymbol()
     {
         string dir = Path.Combine(Path.GetTempPath(), "penumbra-bankglyph-" + Guid.NewGuid().ToString("N"));

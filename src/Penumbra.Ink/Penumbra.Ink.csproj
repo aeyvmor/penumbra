@@ -5,6 +5,11 @@
   </ItemGroup>
 
   <ItemGroup>
+    <!-- The raster/thinning/vectorizing skeletonizer is internal but unit-tested in isolation. -->
+    <InternalsVisibleTo Include="Penumbra.Ink.Tests" />
+  </ItemGroup>
+
+  <ItemGroup>
     <!-- Headless glyph-outline tracing for the cold-start font fallback (Phase 4e). Pinned to the same
          SkiaSharp version Avalonia already brings transitively into the App, so there is one Skia on disk. -->
     <PackageReference Include="SkiaSharp" Version="3.119.4" />

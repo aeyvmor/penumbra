@@ -1,40 +1,40 @@
-<!--
-  This is the CONSUMER-FACING README for the PUBLIC `penumbra` repo.
-  It is NOT the workspace README. The publish script copies this file to README.md
-  in the public repo. Keep it clean: no internal planning, rebuild history, or roadmap.
--->
-
 # Penumbra
 
-**Write math by hand. Watch it answer — in your own handwriting.**
+**Write math by hand. Watch it answer in your own handwriting.**
 
 Penumbra is a local, offline math notebook. Sketch an equation with your pen and it recognizes your
 handwriting, solves it with a real computer-algebra system, and writes the answer back in *your* hand —
 no cloud, no account, everything on your device.
 
-<!-- TODO: hero GIF — the "writes-itself" answer animation -->
+![Penumbra writes an answer in handwriting](assets/hero.gif)
 
-## Features
+## Download
 
-- **Answers in your own handwriting**, animated as if you wrote them.
-- **A real algebra engine** — not a calculator. Symbolic steps, calculus, equation solving.
-- **A living page** — change a number and every dependent result re-solves instantly.
-- **Graphing** — write `y = f(x)` and see it plotted.
-- **A handwriting tutor** that hints and checks your work beside you.
-- **Fully offline** — handwriting recognition runs locally.
+**First release:** `v0.0.1` for Windows x64.
 
-## Status
+Download `Penumbra-v0.0.1-win-x64.zip` from
+[Releases](https://github.com/aeyvmor/penumbra/releases/tag/v0.0.1), unzip it, and run
+`Penumbra.App.exe`.
+
+Windows may warn because this early build is not signed yet.
+
+## What Works Today
 
 Penumbra is in active early development. Expect rough edges.
 
-**What works today:** handwritten arithmetic. Write a single-line expression ending in `=`
-(e.g. `2+2=`, `21+7=`, `4+1-9=`), press **Recognize**, and the computed answer appears. Recognition
-works best with clearly separated symbols. The handwriting-synthesis, reactive sheet, graphing, and
-tutor features listed above are the roadmap — not built yet.
+- Write a single-line expression ending in `=` (for example `2+2=`, `21+7=`, `4+1-9=`).
+- Press **Recognize** and Penumbra computes it locally.
+- The answer writes itself from the `=` in animated handwriting.
+- Penumbra passively learns your digits/operators as you use it; missing symbols fall back to the
+  bundled Caveat handwriting font.
+- Everything runs offline on your machine.
+
+Recognition works best with clearly separated symbols. Fractions, radicals, superscripts, brackets,
+live recognition, graphing, the reactive sheet, and the tutor are future work.
 
 ## Building
 
-Requires the **.NET SDK 8.0+** and **Git LFS** (the recognizer model ships via LFS).
+Requires the **.NET SDK 8.0+** and **Git LFS**. The recognizer model ships via LFS.
 
 ```bash
 git lfs install
@@ -47,6 +47,9 @@ dotnet run --project src/Penumbra.App
 ## License
 
 [MIT](LICENSE).
+
+The shipped recognizer weights have their own provenance note in
+[`src/Penumbra.Recognition/Models/MODELCARD.md`](src/Penumbra.Recognition/Models/MODELCARD.md).
 
 ## Acknowledgements
 

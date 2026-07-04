@@ -92,8 +92,10 @@ public partial class MainWindowViewModel : ViewModelBase
         // user's own hand) for the owned corpus — no sampling/synthesis, that's Phase 4b.
         if (_glyphBank is not null)
         {
+            // Banking demands more confidence than computing (GlyphCapture.BankThreshold > RejectThreshold):
+            // a poisoned exemplar silently corrupts future answers, so the bar to enter the corpus is higher.
             foreach (GlyphSample sample in GlyphCapture.Collect(
-                result.Tokens, Document.Strokes, RejectThreshold, DateTimeOffset.UtcNow))
+                result.Tokens, Document.Strokes, GlyphCapture.BankThreshold, DateTimeOffset.UtcNow))
             {
                 _glyphBank.Capture(sample);
             }
@@ -138,8 +140,12 @@ public partial class MainWindowViewModel : ViewModelBase
         (InkBounds anchor, double lineHeight) = spawn.Value;
         var options = new SynthesisOptions { LineHeight = lineHeight };
 
+        // Draw the handwriting form, not the raw CAS surface: "4 * y" must be written "4y" (juxtaposition),
+        // never traced literally with a scribbly '*'. The typeset RecognitionText keeps the raw DisplayText.
+        string handwriting = HandwritingText.FromDisplayText(answerText);
+
         // Unseeded in the app so repeated identical answers get fresh jitter; tests inject a seeded Random.
-        SynthesizedHandwriting? synthesized = _synthesizer.Synthesize(answerText, anchor, options, new Random());
+        SynthesizedHandwriting? synthesized = _synthesizer.Synthesize(handwriting, anchor, options, new Random());
         if (synthesized is null || synthesized.MissingSymbols.Count > 0)
         {
             return;

@@ -63,9 +63,68 @@ public sealed class GlyphCaptureTests
         Stroke s = StrokeAt(0);
 
         IReadOnlyList<GlyphSample> samples =
-            GlyphCapture.Collect(new[] { Token("x", Threshold, s.Id) }, new[] { s }, Threshold, DateTimeOffset.UnixEpoch);
+            GlyphCapture.Collect(new[] { Token("3", Threshold, s.Id) }, new[] { s }, Threshold, DateTimeOffset.UnixEpoch);
 
         Assert.Single(samples);
+    }
+
+    [Fact]
+    public void BankThreshold_IsHigherThanRejectThreshold()
+    {
+        // Banking demands more confidence than computing: a wrong answer is visible, a poison exemplar isn't.
+        Assert.True(GlyphCapture.BankThreshold > Threshold);
+        Assert.Equal(0.80, GlyphCapture.BankThreshold);
+    }
+
+    [Fact]
+    public void SkipsNonBankableSymbols_EvenWhenConfident()
+    {
+        Stroke digit = StrokeAt(0);
+        Stroke letter = StrokeAt(10);
+        Stroke xVar = StrokeAt(15);
+        Stroke bracket = StrokeAt(20);
+        var tokens = new[]
+        {
+            Token("3", 0.99, digit.Id),
+            Token("y", 0.99, letter.Id),    // mislabelled junk class — not synthesizable, must be skipped
+            Token("x", 0.99, xVar.Id),      // "x" dropped from the policy set (x↔× confusion) — skipped
+            Token("]", 0.99, bracket.Id),   // bracket the synthesizer never emits — skipped
+        };
+
+        IReadOnlyList<GlyphSample> samples = GlyphCapture.Collect(
+            tokens, new[] { digit, letter, xVar, bracket }, GlyphCapture.BankThreshold, DateTimeOffset.UnixEpoch);
+
+        GlyphSample only = Assert.Single(samples);
+        Assert.Equal("3", only.Symbol);
+    }
+
+    [Fact]
+    public void BanksSynthesizableSymbols_IncludingLatexOperators()
+    {
+        var strokes = new List<Stroke>();
+        var tokens = new List<RecognizedToken>();
+        foreach (string label in new[] { "0", "9", "+", "-", ".", "/", "(", ")", "=", "\\times", "\\div", "\\pi" })
+        {
+            Stroke s = StrokeAt(strokes.Count * 3);
+            strokes.Add(s);
+            tokens.Add(Token(label, 0.9, s.Id));
+        }
+
+        IReadOnlyList<GlyphSample> samples = GlyphCapture.Collect(
+            tokens, strokes, GlyphCapture.BankThreshold, DateTimeOffset.UnixEpoch);
+
+        Assert.Equal(tokens.Count, samples.Count);
+    }
+
+    [Fact]
+    public void BelowBankThresholdButAboveRejectThreshold_IsNotBanked()
+    {
+        Stroke s = StrokeAt(0);
+        // 0.7 would compute (>= 0.55) but must not bank (< 0.80).
+        IReadOnlyList<GlyphSample> samples = GlyphCapture.Collect(
+            new[] { Token("3", 0.70, s.Id) }, new[] { s }, GlyphCapture.BankThreshold, DateTimeOffset.UnixEpoch);
+
+        Assert.Empty(samples);
     }
 
     private static RecognizedToken Token(string label, double confidence, params Guid[] strokeIds) =>

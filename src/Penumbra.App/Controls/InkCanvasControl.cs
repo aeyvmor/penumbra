@@ -27,7 +27,7 @@ public sealed class InkCanvasControl : Control
 
     // Wall-clock → animation-time multiplier. Captured pen pace can feel sluggish; bump this to speed up the
     // "write-itself" playback. One named knob so tuning later is a single-line change.
-    private const double PlaybackSpeed = 1.0;
+    private const double PlaybackSpeed = 1.9;
 
     // Repaint cadence while an answer animates (~60 fps).
     private static readonly TimeSpan FrameInterval = TimeSpan.FromMilliseconds(16);

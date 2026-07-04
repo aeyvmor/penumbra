@@ -60,7 +60,10 @@ public sealed class CaveatGlyphSourceTests
             }
         }
 
-        Assert.True(sampleCount >= 8, $"expected >= 8 samples, got {sampleCount}");
+        // Centerline extraction + Douglas-Peucker yields far fewer samples than the old dense contour
+        // trace (which this test used to pin at >= 8) — a '.' skeleton can legitimately be just a couple
+        // of points, so the floor is now 2.
+        Assert.True(sampleCount >= 2, $"expected >= 2 samples, got {sampleCount}");
     }
 
     [Fact]
@@ -93,6 +96,72 @@ public sealed class CaveatGlyphSourceTests
                 Assert.Equal(a[j].Y, b[j].Y);
             }
         }
+    }
+
+    [Fact]
+    public void StraightStemGlyphYieldsAtMostTwoStrokes()
+    {
+        // '1' is essentially a stem (plus Caveat's small flag): a centerline extraction must produce very
+        // few strokes — a contour trace would instead be one long outline loop around the whole shape.
+        IReadOnlyList<Stroke>? glyph = Source().GetGlyph("1", new Random(1));
+
+        Assert.NotNull(glyph);
+        Assert.InRange(glyph!.Count, 1, 2);
+    }
+
+    [Fact]
+    public void LetterYYieldsAtMostThreeStrokes()
+    {
+        IReadOnlyList<Stroke>? glyph = Source().GetGlyph("y", new Random(1));
+
+        Assert.NotNull(glyph);
+        Assert.InRange(glyph!.Count, 1, 3);
+    }
+
+    [Fact]
+    public void CenterlineHalvesTheContourInk_ForO()
+    {
+        // The old approach traced BOTH edges of the pen line ('o' = outer ring + inner ring); the skeleton
+        // is one centerline, so its total ink length must fall well under the contour total. Both lengths
+        // are normalized by the glyph's major-axis span so the comparison is size-independent.
+        IReadOnlyList<Stroke>? glyph = Source().GetGlyph("o", new Random(1));
+        Assert.NotNull(glyph);
+
+        double newLength = 0;
+        foreach (Stroke stroke in glyph!)
+        {
+            for (int i = 1; i < stroke.Samples.Count; i++)
+            {
+                double dx = stroke.Samples[i].X - stroke.Samples[i - 1].X;
+                double dy = stroke.Samples[i].Y - stroke.Samples[i - 1].Y;
+                newLength += Math.Sqrt(dx * dx + dy * dy);
+            }
+        }
+
+        // Reproduce the OLD contour measurement inline: full outline length via SKPathMeasure, normalized
+        // by the same major-axis span the em-box normalization uses.
+        using var typeface = SkiaSharp.SKTypeface.FromFile(FontPath());
+        Assert.NotNull(typeface);
+        using var font = new SkiaSharp.SKFont(typeface, 180f);
+        using SkiaSharp.SKPath? path = font.GetGlyphPath(font.GetGlyph('o'));
+        Assert.NotNull(path);
+
+        double contourLength = 0;
+        using (var measure = new SkiaSharp.SKPathMeasure(path!, forceClosed: false))
+        {
+            do
+            {
+                contourLength += measure.Length;
+            }
+            while (measure.NextContour());
+        }
+
+        SkiaSharp.SKRect bounds = path!.TightBounds;
+        double oldLength = contourLength / Math.Max(bounds.Width, bounds.Height);
+
+        Assert.True(
+            newLength < 0.65 * oldLength,
+            $"expected centerline ink ({newLength:F3}) < 0.65 × contour ink ({oldLength:F3})");
     }
 
     [Fact]
