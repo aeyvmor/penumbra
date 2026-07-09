@@ -10,10 +10,10 @@ no cloud, no account, everything on your device.
 
 ## Download
 
-**First release:** `v0.0.1` for Windows x64.
+**Latest release:** `v0.0.2` for Windows x64.
 
-Download `Penumbra-v0.0.1-win-x64.zip` from
-[Releases](https://github.com/aeyvmor/penumbra/releases/tag/v0.0.1), unzip it, and run
+Download `Penumbra-v0.0.2-win-x64.zip` from
+[Releases](https://github.com/aeyvmor/penumbra/releases/latest), unzip it, and run
 `Penumbra.App.exe`.
 
 Windows may warn because this early build is not signed yet.
@@ -22,15 +22,17 @@ Windows may warn because this early build is not signed yet.
 
 Penumbra is in active early development. Expect rough edges.
 
-- Write a single-line expression ending in `=` (for example `2+2=`, `21+7=`, `4+1-9=`).
-- Press **Recognize** and Penumbra computes it locally.
-- The answer writes itself from the `=` in animated handwriting.
+- Write a single-line expression ending in `=` (for example `2+2=`, `21+7=`, `4+1-9=`) — lift the
+  pen, and a beat later the answer writes itself from the `=` in animated handwriting. No button.
+- Symbols Penumbra isn't sure about desaturate and shiver; when it can't read a line at all, it
+  says so instead of guessing (the recognizer is confidence-calibrated and refuses non-math ink).
+- Tap an answer to highlight the exact strokes it came from.
 - Penumbra passively learns your digits/operators as you use it; missing symbols fall back to the
   bundled Caveat handwriting font.
 - Everything runs offline on your machine.
 
 Recognition works best with clearly separated symbols. Fractions, radicals, superscripts, brackets,
-live recognition, graphing, the reactive sheet, and the tutor are future work.
+graphing, the reactive sheet, and the tutor are future work.
 
 ## Building
 
