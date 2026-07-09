@@ -1,3 +1,4 @@
+using Avalonia.Threading;
 using CommunityToolkit.Mvvm.ComponentModel;
 using CommunityToolkit.Mvvm.Input;
 using Penumbra.Cas;
@@ -8,31 +9,64 @@ using Penumbra.Recognition;
 
 namespace Penumbra.App.ViewModels;
 
-public partial class MainWindowViewModel : ViewModelBase
+public partial class MainWindowViewModel : ViewModelBase, IDisposable
 {
     private static readonly IReadOnlyDictionary<string, string> NoVariables = new Dictionary<string, string>();
+    private static readonly IReadOnlySet<Guid> NoStrokes = new HashSet<Guid>();
+    private const string IdleHint = "Write an expression ending in '=' — it answers when you pause";
 
     /// <summary>
-    /// Reject reads whose weakest symbol scores below this. Initial guess — the Phase 3.9 plan tunes it
-    /// empirically on real ink, and a principled per-class calibration ships with the next recognizer
-    /// retrain. The same bar decides which glyphs are confident enough to bank.
+    /// The recognizer's decision contract (audit B4): the reject bar (<c>MinConfidence</c> — reads whose
+    /// weakest symbol scores below it are refused) and the stricter banking bar (<c>BankConfidence</c>);
+    /// temperature scaling and energy rejection are applied inside the classifier itself. Injected from
+    /// the model's meta.json via DI so the bars always match the confidences that model actually
+    /// produces; <see cref="RecognitionCalibration.Default"/> (reject 0.55, bank 0.80 — the pre-B4
+    /// hardcoded constants) for design time and models whose meta predates calibration.
     /// </summary>
-    public const double RejectThreshold = 0.55;
+    private readonly RecognitionCalibration _calibration = RecognitionCalibration.Default;
+
+    /// <summary>
+    /// 4.5b: how long the pen must stay up before a live read fires. Tuned by dogfood: 600 ms fired
+    /// between the two strokes of a '+' (mouse repositioning gaps run 600–900 ms), glitching the
+    /// half-drawn symbol mid-writing. If the pen retest still trips this, the designed escalation is
+    /// a two-tier debounce (read fast, show glitch/reject UX only after a longer quiet), not more delay.
+    /// </summary>
+    internal static readonly TimeSpan LiveQuietPeriod = TimeSpan.FromSeconds(1);
 
     private readonly IRecognizer _recognizer;
     private readonly IEvaluator? _evaluator;
     private readonly IGlyphBank? _glyphBank;
     private readonly HandwritingSynthesizer? _synthesizer;
+    private readonly Debouncer _liveDebouncer;
+
+    // 4.5b corpus-poison guard: the stroke-sets already banked this page, so re-reads never re-bank
+    // the same physical ink (see GlyphCapture dedup overload). Cleared when the page empties.
+    private readonly HashSet<string> _bankedStrokeSets = new();
+
+    // The in-flight read's cancellation, superseded by every newer read and by pen-down.
+    private CancellationTokenSource? _recognitionCts;
 
     // Bumped on every animation so the freshly-built AnswerAnimation never compares equal to the last one,
     // guaranteeing the canvas's styled property fires even for a re-computed identical answer.
     private long _animationSequence;
+
+    // What the current AnswerAnimation shows, as (recognized latex, answer text) — live re-reads of the
+    // same line skip re-playing an identical answer (an unrelated edit elsewhere must not replay it).
+    private (string Latex, string Answer)? _lastAnimated;
+
+    // Seam-1 tokens behind the displayed answer — the ghost-trace provenance source (4.5d).
+    private IReadOnlyList<RecognizedToken> _lastAnsweredTokens = Array.Empty<RecognizedToken>();
 
     public MainWindowViewModel()
     {
         Document = new InkDocument();
         Document.Changed += (_, _) => OnDocumentChanged();
         _recognizer = new NoOpRecognizer();   // design-time fallback; DI overrides below
+
+        // The debouncer fires on a timer thread; recognition + all state changes belong to the UI thread.
+        _liveDebouncer = new Debouncer(
+            LiveQuietPeriod,
+            () => Dispatcher.UIThread.Post(() => _ = RecognizeCoreAsync(manual: false)));
     }
 
     public MainWindowViewModel(
@@ -40,7 +74,8 @@ public partial class MainWindowViewModel : ViewModelBase
         IRecognizer recognizer,
         IGraphDetector graphDetector,
         IGlyphBank? glyphBank = null,
-        HandwritingSynthesizer? synthesizer = null)
+        HandwritingSynthesizer? synthesizer = null,
+        RecognitionCalibration? calibration = null)
         : this()
     {
         ArgumentNullException.ThrowIfNull(evaluator);
@@ -50,6 +85,7 @@ public partial class MainWindowViewModel : ViewModelBase
         _evaluator = evaluator;
         _glyphBank = glyphBank;
         _synthesizer = synthesizer;
+        _calibration = calibration ?? RecognitionCalibration.Default;
     }
 
     /// <summary>The page being drawn on; owns the strokes and the undo/redo history.</summary>
@@ -57,7 +93,7 @@ public partial class MainWindowViewModel : ViewModelBase
 
     /// <summary>What the recognizer last read / computed (shown under the canvas).</summary>
     [ObservableProperty]
-    private string _recognitionText = "Write an expression ending in '=', then press Recognize";
+    private string _recognitionText = IdleHint;
 
     /// <summary>
     /// The answer layer the canvas plays on top of the ink, or null when there's nothing to animate.
@@ -66,41 +102,125 @@ public partial class MainWindowViewModel : ViewModelBase
     [ObservableProperty]
     private AnswerAnimation? _answerAnimation;
 
-    [RelayCommand(CanExecute = nameof(CanRecognize))]
-    private void Recognize()
-    {
-        // A new read supersedes any previously-playing answer; clear first so every failure path below
-        // leaves no stale animation on the canvas.
-        AnswerAnimation = null;
+    /// <summary>4.5b: recognize automatically a beat after pen-lift. The button remains as a manual re-read.</summary>
+    [ObservableProperty]
+    private bool _liveRecognition = true;
 
-        RecognitionResult result = _recognizer.Recognize(Document.Strokes);
+    /// <summary>4.5c: strokes of below-threshold symbols; the canvas renders them as glitch-ink.</summary>
+    [ObservableProperty]
+    private IReadOnlySet<Guid> _uncertainStrokeIds = NoStrokes;
+
+    /// <summary>4.5d: strokes to highlight as the displayed answer's provenance (empty = no highlight).</summary>
+    [ObservableProperty]
+    private IReadOnlySet<Guid> _provenanceStrokeIds = NoStrokes;
+
+    /// <summary>
+    /// 4.5b: the pen touched down. A pending or in-flight read is stale by construction — its snapshot
+    /// misses the stroke being drawn — and an answer materializing mid-stroke is jank, so both die here.
+    /// </summary>
+    public void NotifyStrokeStarted()
+    {
+        _liveDebouncer.Cancel();
+        _recognitionCts?.Cancel();
+    }
+
+    /// <summary>
+    /// 4.5d: tap on the played answer — toggle the highlight of the ink it was recognized from.
+    /// Seam 1 makes this a set-union: every answered token knows its source strokes.
+    /// </summary>
+    public void ToggleAnswerProvenance()
+    {
+        if (ProvenanceStrokeIds.Count > 0)
+        {
+            ProvenanceStrokeIds = NoStrokes;
+            return;
+        }
+
+        var ids = new HashSet<Guid>();
+        foreach (RecognizedToken token in _lastAnsweredTokens)
+        {
+            foreach (Guid id in token.SourceStrokeIds)
+            {
+                ids.Add(id);
+            }
+        }
+
+        ProvenanceStrokeIds = ids;
+    }
+
+    [RelayCommand(CanExecute = nameof(CanRecognize))]
+    private Task Recognize() => RecognizeCoreAsync(manual: true);
+
+    /// <summary>
+    /// The one recognition path (button and live debounce both land here). Snapshots the strokes —
+    /// <see cref="InkDocument.Strokes"/> is the live list and this leaves the UI thread — starts a
+    /// fresh cancellation scope that supersedes any older read, and applies the result unless a newer
+    /// read (or pen-down) cancelled it first.
+    /// </summary>
+    private async Task RecognizeCoreAsync(bool manual)
+    {
+        if (Document.Strokes.Count == 0)
+        {
+            return;
+        }
+
+        if (manual)
+        {
+            // Manual semantics predate live mode: a clicked re-read supersedes the playing answer up
+            // front, so every failure path below leaves a clean canvas. Live reads are gentler — they
+            // keep the last answer through transient mid-writing failures.
+            AnswerAnimation = null;
+            _lastAnimated = null;
+        }
+
+        _recognitionCts?.Cancel();
+        _recognitionCts?.Dispose();
+        var cts = new CancellationTokenSource();
+        _recognitionCts = cts;
+
+        Stroke[] snapshot = Document.Strokes.ToArray();
+
+        RecognitionResult result;
+        try
+        {
+            result = await _recognizer.RecognizeAsync(snapshot, cts.Token);
+        }
+        catch (OperationCanceledException)
+        {
+            return;   // superseded — the newer read owns the UI
+        }
+
+        if (cts.Token.IsCancellationRequested)
+        {
+            return;
+        }
+
+        ApplyRecognition(result, snapshot, manual);
+    }
+
+    private void ApplyRecognition(RecognitionResult result, IReadOnlyList<Stroke> snapshot, bool manual)
+    {
+        // Any fresh read invalidates a provenance highlight — it described the previous answer.
+        ProvenanceStrokeIds = NoStrokes;
+
         if (string.IsNullOrEmpty(result.Latex))
         {
             RecognitionText = "(couldn't read that — try clearer symbols)";
+            UncertainStrokeIds = NoStrokes;
             return;
         }
 
         // 3.9c: refuse to compute on a shaky read, naming the ambiguous symbol rather than guessing.
-        RecognitionGate.GateResult gate = RecognitionGate.Evaluate(result, RejectThreshold);
+        // 4.5c: and give the refusal a body — the offending strokes themselves glitch on the canvas.
+        RecognitionGate.GateResult gate = RecognitionGate.Evaluate(result, _calibration.MinConfidence);
         if (!gate.Accepted)
         {
             RecognitionText = gate.Refusal!;
+            UncertainStrokeIds = RecognitionGate.UncertainStrokeIds(result, _calibration.MinConfidence);
             return;
         }
 
-        // 3.9d: the read is trustworthy, so passively bank the confidently-recognized glyphs (in the
-        // user's own hand) for the owned corpus — no sampling/synthesis, that's Phase 4b.
-        if (_glyphBank is not null)
-        {
-            // Banking demands more confidence than computing (GlyphCapture.BankThreshold > RejectThreshold):
-            // a poisoned exemplar silently corrupts future answers, so the bar to enter the corpus is higher.
-            foreach (GlyphSample sample in GlyphCapture.Collect(
-                result.Tokens, Document.Strokes, GlyphCapture.BankThreshold, DateTimeOffset.UtcNow))
-            {
-                _glyphBank.Capture(sample);
-            }
-        }
-
+        UncertainStrokeIds = NoStrokes;
         string expression = result.Latex;
 
         // A trailing '=' is the "compute me" trigger; otherwise just echo what was read.
@@ -115,7 +235,19 @@ public partial class MainWindowViewModel : ViewModelBase
 
             if (answer.IsComputed)
             {
-                TryAnimateAnswer(answer.DisplayText, result.Tokens);
+                // 4.5b: bank only here — a computed '='-read means the expression was FINISHED, so no
+                // partial glyph (the first bar of a live-written '=' reads as a confident '-') can ever
+                // enter the corpus. The dedup set stops re-reads from banking the same ink twice.
+                if (_glyphBank is not null)
+                {
+                    foreach (GlyphSample sample in GlyphCapture.Collect(
+                        result.Tokens, snapshot, _calibration.BankConfidence, DateTimeOffset.UtcNow, _bankedStrokeSets))
+                    {
+                        _glyphBank.Capture(sample);
+                    }
+                }
+
+                AnimateAnswer(answer.DisplayText, result, manual);
             }
 
             return;
@@ -125,16 +257,37 @@ public partial class MainWindowViewModel : ViewModelBase
     }
 
     /// <summary>
-    /// Best-effort: spawn the animated answer from the '=' sign. Silently no-ops (leaving the typeset text as
-    /// the sole readout) when there's no synthesizer, no '=' anchor, or any output symbol the sources can't
-    /// supply — an honest fallback until the 4e font source guarantees full coverage.
+    /// Plays the answer unless this is a live re-read of exactly what's already showing — the page
+    /// re-reads on every pen-lift, and replaying an unchanged answer each time is noise. The manual
+    /// button always replays (the user asked).
     /// </summary>
-    private void TryAnimateAnswer(string answerText, IReadOnlyList<RecognizedToken> tokens)
+    private void AnimateAnswer(string answerText, RecognitionResult result, bool manual)
+    {
+        (string Latex, string Answer) key = (result.Latex, answerText);
+        if (!manual && AnswerAnimation is not null && _lastAnimated == key)
+        {
+            return;
+        }
+
+        if (TryBuildAnimation(answerText, result.Tokens) is { } animation)
+        {
+            AnswerAnimation = animation;
+            _lastAnimated = key;
+            _lastAnsweredTokens = result.Tokens;
+        }
+    }
+
+    /// <summary>
+    /// Best-effort: build the animated answer spawning from the '=' sign. Silently yields null (leaving the
+    /// typeset text as the sole readout) when there's no synthesizer, no '=' anchor, or any output symbol the
+    /// sources can't supply — an honest fallback until the 4e font source guarantees full coverage.
+    /// </summary>
+    private AnswerAnimation? TryBuildAnimation(string answerText, IReadOnlyList<RecognizedToken> tokens)
     {
         (InkBounds Anchor, double LineHeight)? spawn = FindSpawn(tokens);
         if (_synthesizer is null || spawn is null)
         {
-            return;
+            return null;
         }
 
         (InkBounds anchor, double lineHeight) = spawn.Value;
@@ -148,10 +301,10 @@ public partial class MainWindowViewModel : ViewModelBase
         SynthesizedHandwriting? synthesized = _synthesizer.Synthesize(handwriting, anchor, options, new Random());
         if (synthesized is null || synthesized.MissingSymbols.Count > 0)
         {
-            return;
+            return null;
         }
 
-        AnswerAnimation = new AnswerAnimation(synthesized, ++_animationSequence);
+        return new AnswerAnimation(synthesized, ++_animationSequence);
     }
 
     /// <summary>
@@ -214,15 +367,28 @@ public partial class MainWindowViewModel : ViewModelBase
     private bool CanRedo => Document.CanRedo;
 
     [RelayCommand(CanExecute = nameof(CanClear))]
-    private void Clear()
-    {
-        // Clearing the page also wipes the answer layer. Adding a stroke does NOT (see OnDocumentChanged):
-        // the user may keep writing beside a played answer, and it stays until Clear or the next Recognize.
+    private void Clear() =>
+        // Emptying the page triggers the full transient reset (answer, glitch, provenance, banked keys)
+        // via OnDocumentChanged — one code path whether the page empties by Clear, undo, or load.
         Document.Clear();
-        AnswerAnimation = null;
-    }
 
     private bool CanClear => Document.Strokes.Count > 0;
+
+    partial void OnLiveRecognitionChanged(bool value)
+    {
+        if (value)
+        {
+            // Turning live on with ink already on the page: read it after one quiet period.
+            if (Document.Strokes.Count > 0)
+            {
+                _liveDebouncer.Signal();
+            }
+        }
+        else
+        {
+            _liveDebouncer.Cancel();
+        }
+    }
 
     private void OnDocumentChanged()
     {
@@ -230,5 +396,42 @@ public partial class MainWindowViewModel : ViewModelBase
         RedoCommand.NotifyCanExecuteChanged();
         ClearCommand.NotifyCanExecuteChanged();
         RecognizeCommand.NotifyCanExecuteChanged();
+
+        // Whatever the highlight pointed at, the page just changed under it.
+        ProvenanceStrokeIds = NoStrokes;
+
+        if (Document.Strokes.Count == 0)
+        {
+            ResetTransientState();
+            return;
+        }
+
+        // 4.5b: the pen lifted (or undo/redo/load changed the ink) — read the page after a quiet beat.
+        if (LiveRecognition)
+        {
+            _liveDebouncer.Signal();
+        }
+    }
+
+    /// <summary>The page is empty: nothing to read, answer, glitch, highlight, or remember.</summary>
+    private void ResetTransientState()
+    {
+        _liveDebouncer.Cancel();
+        _recognitionCts?.Cancel();
+        AnswerAnimation = null;
+        _lastAnimated = null;
+        _lastAnsweredTokens = Array.Empty<RecognizedToken>();
+        UncertainStrokeIds = NoStrokes;
+        ProvenanceStrokeIds = NoStrokes;
+        _bankedStrokeSets.Clear();
+        RecognitionText = IdleHint;
+    }
+
+    public void Dispose()
+    {
+        _liveDebouncer.Dispose();
+        _recognitionCts?.Cancel();
+        _recognitionCts?.Dispose();
+        _recognitionCts = null;
     }
 }

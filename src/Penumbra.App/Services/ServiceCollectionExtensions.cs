@@ -20,6 +20,13 @@ public static class ServiceCollectionExtensions
         services.AddSingleton<IEvaluator, AngouriMathEvaluator>();
         services.AddSingleton<IGraphDetector, NoOpGraphDetector>();
 
+        // B4: the decision contract (reject/bank bars, temperature + energy applied in-classifier) rides
+        // the model artifact — the ViewModel gets whatever the loaded meta.json ships, with
+        // RecognitionCalibration.Default covering pre-calibration models and non-ONNX classifiers.
+        services.AddSingleton(sp => sp.GetRequiredService<ISymbolClassifier>() is OnnxSymbolClassifier onnx
+            ? onnx.Calibration
+            : RecognitionCalibration.Default);
+
         // 3.9d: the glyph bank fills passively during normal use; persisted per-user under AppData.
         services.AddSingleton<IGlyphBank>(_ => new JsonGlyphBank(Path.Combine(
             Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),

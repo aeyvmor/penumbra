@@ -33,9 +33,34 @@ public sealed class OnnxSymbolClassifier : ISymbolClassifier, IDisposable
         _std = (float)root.GetProperty("std").GetDouble();
         _featMean = root.GetProperty("feat_mean").EnumerateArray().Select(e => (float)e.GetDouble()).ToArray();
         _featStd = root.GetProperty("feat_std").EnumerateArray().Select(e => (float)e.GetDouble()).ToArray();
+        Calibration = ReadCalibration(root);
 
         _session = new InferenceSession(onnxPath);
     }
+
+    /// <summary>
+    /// The decision contract shipped in this model's <c>meta.json</c> (audit B4) — temperature, energy
+    /// reject threshold, and the app's reject/bank confidence bars. <see cref="RecognitionCalibration.Default"/>
+    /// when the meta predates the calibrated-retrain fields, so old artifacts behave exactly as before.
+    /// </summary>
+    public RecognitionCalibration Calibration { get; }
+
+    /// <summary>
+    /// Reads the optional B4 calibration fields, falling back per-field to
+    /// <see cref="RecognitionCalibration.Default"/> — a partially calibrated meta (e.g. temperature fitted
+    /// but no reject threshold picked) still gets sensible behaviour for the missing pieces.
+    /// </summary>
+    private static RecognitionCalibration ReadCalibration(JsonElement root) => new(
+        Temperature: ReadDoubleOrDefault(root, "temperature", RecognitionCalibration.Default.Temperature),
+        RejectEnergyThreshold: ReadDoubleOrDefault(
+            root, "reject_energy_threshold", RecognitionCalibration.Default.RejectEnergyThreshold),
+        MinConfidence: ReadDoubleOrDefault(root, "min_confidence", RecognitionCalibration.Default.MinConfidence),
+        BankConfidence: ReadDoubleOrDefault(root, "bank_confidence", RecognitionCalibration.Default.BankConfidence));
+
+    private static double ReadDoubleOrDefault(JsonElement root, string name, double fallback) =>
+        root.TryGetProperty(name, out JsonElement value) && value.ValueKind == JsonValueKind.Number
+            ? value.GetDouble()
+            : fallback;
 
     /// <inheritdoc />
     public SymbolPrediction Classify(IReadOnlyList<Stroke> strokes, SymbolContext context)
@@ -61,26 +86,84 @@ public sealed class OnnxSymbolClassifier : ISymbolClassifier, IDisposable
         using IDisposableReadOnlyCollection<DisposableNamedOnnxValue> results = _session.Run(inputs);
         float[] scores = results.First().AsEnumerable<float>().ToArray();
 
-        (int best, float confidence) = Softmax(scores);
-        return new SymbolPrediction(_classes[best], confidence);
+        return Predict(scores);
     }
 
-    private static (int Index, float Probability) Softmax(float[] scores)
+    /// <inheritdoc />
+    /// <remarks>
+    /// One <c>_session.Run</c> for the whole line via the model's dynamic batch axis (Phase 4.5a) —
+    /// the per-symbol preprocessing is identical to <see cref="Classify"/>, so batch and single
+    /// calls score identically; the parity test pins that.
+    /// </remarks>
+    public IReadOnlyList<SymbolPrediction> ClassifyBatch(
+        IReadOnlyList<IReadOnlyList<Stroke>> symbols, SymbolContext context)
     {
-        float max = scores.Max();
-        double sum = 0;
-        int best = 0;
-        for (int i = 0; i < scores.Length; i++)
+        ArgumentNullException.ThrowIfNull(symbols);
+
+        var predictions = new SymbolPrediction[symbols.Count];
+
+        // Preprocess every non-empty symbol; empty ones keep the same "no ink → empty label" contract
+        // as Classify without ever reaching the model.
+        var batchIndices = new List<int>(symbols.Count);
+        for (int i = 0; i < symbols.Count; i++)
         {
-            sum += Math.Exp(scores[i] - max);
-            if (scores[i] > scores[best])
+            if (symbols[i].Count > 0 && symbols[i].Any(s => s.Samples.Count > 0))
             {
-                best = i;
+                batchIndices.Add(i);
+            }
+            else
+            {
+                predictions[i] = new SymbolPrediction(string.Empty, 0);
             }
         }
 
-        float prob = (float)(Math.Exp(scores[best] - max) / sum);
-        return (best, prob);
+        if (batchIndices.Count == 0)
+        {
+            return predictions;
+        }
+
+        int n = batchIndices.Count;
+        int imageLen = SymbolPreprocessor.ImageSize * SymbolPreprocessor.ImageSize;
+        var images = new float[n * imageLen];
+        var features = new float[n * SymbolPreprocessor.FeatureCount];
+        for (int b = 0; b < n; b++)
+        {
+            IReadOnlyList<Stroke> strokes = symbols[batchIndices[b]];
+            SymbolPreprocessor.RenderImage(strokes, _mean, _std).CopyTo(images, b * imageLen);
+            SymbolPreprocessor.ComputeFeatures(strokes, context, _featMean, _featStd)
+                .CopyTo(features, b * SymbolPreprocessor.FeatureCount);
+        }
+
+        var inputs = new[]
+        {
+            NamedOnnxValue.CreateFromTensor("image", new DenseTensor<float>(
+                images, new[] { n, 1, SymbolPreprocessor.ImageSize, SymbolPreprocessor.ImageSize })),
+            NamedOnnxValue.CreateFromTensor("features", new DenseTensor<float>(
+                features, new[] { n, SymbolPreprocessor.FeatureCount })),
+        };
+
+        using IDisposableReadOnlyCollection<DisposableNamedOnnxValue> results = _session.Run(inputs);
+        float[] scores = results.First().AsEnumerable<float>().ToArray();
+        int classCount = scores.Length / n;
+
+        for (int b = 0; b < n; b++)
+        {
+            var row = new float[classCount];
+            Array.Copy(scores, b * classCount, row, 0, classCount);
+            predictions[batchIndices[b]] = Predict(row);
+        }
+
+        return predictions;
+    }
+
+    /// <summary>
+    /// One symbol's logits → calibrated prediction. Single and batch paths both land here, so temperature
+    /// scaling and energy rejection can never diverge between them (the batch-vs-single parity test pins it).
+    /// </summary>
+    private SymbolPrediction Predict(float[] logits)
+    {
+        (int best, double confidence, double energy, bool rejected) = Calibration.Apply(logits);
+        return new SymbolPrediction(_classes[best], confidence, energy, rejected);
     }
 
     public void Dispose() => _session.Dispose();

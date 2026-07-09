@@ -25,7 +25,23 @@ public sealed class ExpressionRecognizer : IRecognizer
     }
 
     /// <inheritdoc />
-    public RecognitionResult Recognize(IReadOnlyList<Stroke> strokes)
+    public RecognitionResult Recognize(IReadOnlyList<Stroke> strokes) =>
+        Recognize(strokes, CancellationToken.None);
+
+    /// <inheritdoc />
+    /// <remarks>
+    /// 4.5a: recognition is CPU-bound (segmentation + one batched ONNX call), so async means "run it
+    /// on the pool with cancellation checked at stage boundaries" — a superseded live read stops
+    /// before the model call instead of wasting an inference on stale ink.
+    /// </remarks>
+    public Task<RecognitionResult> RecognizeAsync(
+        IReadOnlyList<Stroke> strokes, CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(strokes);
+        return Task.Run(() => Recognize(strokes, cancellationToken), cancellationToken);
+    }
+
+    private RecognitionResult Recognize(IReadOnlyList<Stroke> strokes, CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(strokes);
 
@@ -45,11 +61,13 @@ public sealed class ExpressionRecognizer : IRecognizer
         // Computed over the SELECTED line only: that per-line scope is the actual stray-mark guard.
         SymbolContext context = LineContext(groups);
 
-        var predictions = new SymbolPrediction[groups.Count];
-        for (int i = 0; i < groups.Count; i++)
-        {
-            predictions[i] = _classifier.Classify(groups[i].Strokes, context);
-        }
+        cancellationToken.ThrowIfCancellationRequested();
+
+        // 4.5a: the whole line in ONE model call (the classifier batches when its backend can).
+        IReadOnlyList<SymbolPrediction> predictions = _classifier.ClassifyBatch(
+            groups.Select(g => g.Strokes).ToList(), context);
+
+        cancellationToken.ThrowIfCancellationRequested();
 
         // 3.9b: correct the digit-context glyph confusions before assembly, so both the emitted
         // LaTeX and the Seam-1 token labels carry the geometry-aware reading.
@@ -68,7 +86,8 @@ public sealed class ExpressionRecognizer : IRecognizer
                 label,
                 group.Strokes.Select(s => s.Id).ToList(),
                 group.Bounds,
-                predictions[i].Confidence));
+                predictions[i].Confidence,
+                predictions[i].Rejected));   // B4: the OOD flag rides Seam 1 so the gate can see it
 
             // 3.9a: a control word ("\pi", "\times", …) needs a trailing separator, else "\pi"
             // followed by "x" assembles to "\pix" — a phantom variable the translator reads as

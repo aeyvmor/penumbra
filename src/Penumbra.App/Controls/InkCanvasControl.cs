@@ -25,6 +25,20 @@ public sealed class InkCanvasControl : Control
     public static readonly StyledProperty<AnswerAnimation?> AnswerAnimationProperty =
         AvaloniaProperty.Register<InkCanvasControl, AnswerAnimation?>(nameof(AnswerAnimation));
 
+    // 4.5c: strokes the recognizer can't stand behind — rendered desaturated + shivering.
+    public static readonly StyledProperty<IReadOnlySet<Guid>?> UncertainStrokeIdsProperty =
+        AvaloniaProperty.Register<InkCanvasControl, IReadOnlySet<Guid>?>(nameof(UncertainStrokeIds));
+
+    // 4.5d: strokes highlighted as the displayed answer's provenance (amber glow underlay).
+    public static readonly StyledProperty<IReadOnlySet<Guid>?> ProvenanceStrokeIdsProperty =
+        AvaloniaProperty.Register<InkCanvasControl, IReadOnlySet<Guid>?>(nameof(ProvenanceStrokeIds));
+
+    /// <summary>4.5b: the user just started drawing a stroke (pen/mouse down) — live reads go stale now.</summary>
+    public event EventHandler? DrawingStarted;
+
+    /// <summary>4.5d: the user tapped the played answer (the tap is consumed, not inked).</summary>
+    public event EventHandler? AnswerTapped;
+
     // Wall-clock → animation-time multiplier. Captured pen pace can feel sluggish; bump this to speed up the
     // "write-itself" playback. One named knob so tuning later is a single-line change.
     private const double PlaybackSpeed = 1.9;
@@ -32,8 +46,22 @@ public sealed class InkCanvasControl : Control
     // Repaint cadence while an answer animates (~60 fps).
     private static readonly TimeSpan FrameInterval = TimeSpan.FromMilliseconds(16);
 
+    // 4.5d tap geometry, in SCREEN pixels so the gesture feels the same at any zoom: a tap's samples all
+    // stay within the slop, and the tap counts only if it lands within the tolerance of answer ink.
+    private const double TapSlopScreenPx = 6;
+    private const double TapToleranceScreenPx = 12;
+
+    // 4.5c glitch: subtle shiver, in world units. Slow and small on purpose — "unsettled", not "alarm".
+    private const double GlitchAmplitude = 1.4;
+
     private static readonly IImmutableSolidColorBrush PaperBrush = new ImmutableSolidColorBrush(Color.FromRgb(0xF8, 0xF9, 0xFB));
     private static readonly IImmutableSolidColorBrush InkBrush = new ImmutableSolidColorBrush(Color.FromRgb(0x18, 0x20, 0x2A));
+
+    // Desaturated ink for uncertain strokes: clearly "less real" than ink without becoming invisible.
+    private static readonly IImmutableSolidColorBrush UncertainBrush = new ImmutableSolidColorBrush(Color.FromRgb(0x9A, 0xA6, 0xB5));
+
+    // Amber underlay for provenance-highlighted strokes.
+    private static readonly IImmutableSolidColorBrush GlowBrush = new ImmutableSolidColorBrush(Color.FromArgb(0x55, 0xF5, 0x9E, 0x0B));
 
     private readonly Stopwatch _clock = Stopwatch.StartNew();
     private readonly StrokeWidthModel _widthModel = new();
@@ -43,6 +71,9 @@ public sealed class InkCanvasControl : Control
     private SynthesizedHandwriting? _answer;
     private TimeSpan _answerStart;
     private DispatcherTimer? _answerTimer;
+
+    // Ticks repaints while any stroke is glitching (4.5c); null when the uncertain set is empty.
+    private DispatcherTimer? _glitchTimer;
 
     // The document stores raw pen data (for recognizer/glyph-bank parity). Smoothing is display-only and
     // happens here at render time, cached per stroke id so we don't re-smooth every frame.
@@ -81,6 +112,20 @@ public sealed class InkCanvasControl : Control
         set => SetValue(AnswerAnimationProperty, value);
     }
 
+    /// <summary>Strokes rendered as glitch-ink (4.5c), or null/empty for none.</summary>
+    public IReadOnlySet<Guid>? UncertainStrokeIds
+    {
+        get => GetValue(UncertainStrokeIdsProperty);
+        set => SetValue(UncertainStrokeIdsProperty, value);
+    }
+
+    /// <summary>Strokes highlighted as answer provenance (4.5d), or null/empty for none.</summary>
+    public IReadOnlySet<Guid>? ProvenanceStrokeIds
+    {
+        get => GetValue(ProvenanceStrokeIdsProperty);
+        set => SetValue(ProvenanceStrokeIdsProperty, value);
+    }
+
     protected override void OnPropertyChanged(AvaloniaPropertyChangedEventArgs change)
     {
         base.OnPropertyChanged(change);
@@ -102,6 +147,14 @@ public sealed class InkCanvasControl : Control
         else if (change.Property == AnswerAnimationProperty)
         {
             OnAnswerAnimationChanged(change.NewValue as AnswerAnimation);
+        }
+        else if (change.Property == UncertainStrokeIdsProperty)
+        {
+            OnUncertainStrokeIdsChanged(change.NewValue as IReadOnlySet<Guid>);
+        }
+        else if (change.Property == ProvenanceStrokeIdsProperty)
+        {
+            InvalidateVisual();
         }
     }
 
@@ -155,10 +208,47 @@ public sealed class InkCanvasControl : Control
         _answerTimer = null;
     }
 
+    // --- Glitch-ink (4.5c) -------------------------------------------------------------------------
+
+    // The shiver is time-driven, so it needs a repaint tick — but only while something is uncertain.
+    private void OnUncertainStrokeIdsChanged(IReadOnlySet<Guid>? ids)
+    {
+        if (ids is { Count: > 0 })
+        {
+            if (_glitchTimer is null)
+            {
+                _glitchTimer = new DispatcherTimer { Interval = FrameInterval };
+                _glitchTimer.Tick += OnGlitchTick;
+                _glitchTimer.Start();
+            }
+        }
+        else
+        {
+            StopGlitchTimer();
+        }
+
+        InvalidateVisual();
+    }
+
+    private void OnGlitchTick(object? sender, EventArgs e) => InvalidateVisual();
+
+    private void StopGlitchTimer()
+    {
+        if (_glitchTimer is null)
+        {
+            return;
+        }
+
+        _glitchTimer.Stop();
+        _glitchTimer.Tick -= OnGlitchTick;
+        _glitchTimer = null;
+    }
+
     protected override void OnDetachedFromVisualTree(VisualTreeAttachmentEventArgs e)
     {
         base.OnDetachedFromVisualTree(e);
-        StopAnswerTimer();   // don't leave a timer running against a detached control.
+        StopAnswerTimer();   // don't leave timers running against a detached control.
+        StopGlitchTimer();
     }
 
     // --- Rendering -------------------------------------------------------------------------------
@@ -176,10 +266,33 @@ public sealed class InkCanvasControl : Control
         {
             if (doc is not null)
             {
+                IReadOnlySet<Guid>? uncertain = UncertainStrokeIds;
+                IReadOnlySet<Guid>? provenance = ProvenanceStrokeIds;
+
+                // 4.5d: glow underlay pass first, so no highlighted stroke's glow sits on a neighbour's ink.
+                if (provenance is { Count: > 0 })
+                {
+                    foreach (Stroke stroke in doc.Strokes)
+                    {
+                        if (provenance.Contains(stroke.Id))
+                        {
+                            DrawStroke(context, _smoothCache.GetSmoothed(stroke), GlowBrush, widthPad: 7);
+                        }
+                    }
+                }
+
                 foreach (Stroke stroke in doc.Strokes)
                 {
                     // Strokes are stored raw; draw the smoothed form (cached per id).
-                    DrawStroke(context, _smoothCache.GetSmoothed(stroke));
+                    Stroke smoothed = _smoothCache.GetSmoothed(stroke);
+                    if (uncertain is not null && uncertain.Contains(stroke.Id))
+                    {
+                        DrawGlitchStroke(context, smoothed);   // 4.5c: the reject, made visible in-place
+                    }
+                    else
+                    {
+                        DrawStroke(context, smoothed);
+                    }
                 }
 
                 // Bound the cache: forget strokes that are no longer present (cleared/undone).
@@ -205,7 +318,12 @@ public sealed class InkCanvasControl : Control
         }
     }
 
-    private void DrawStroke(DrawingContext context, Stroke stroke)
+    private void DrawStroke(DrawingContext context, Stroke stroke) =>
+        DrawStroke(context, stroke, InkBrush, widthPad: 0);
+
+    // One body for ink, glitch-ink, and the provenance glow: same width model, different brush, and an
+    // optional pad that widens every segment (the glow is the ink's own shape, inflated).
+    private void DrawStroke(DrawingContext context, Stroke stroke, IImmutableSolidColorBrush brush, double widthPad)
     {
         IReadOnlyList<StrokeSample> samples = stroke.Samples;
         if (samples.Count == 0)
@@ -218,19 +336,36 @@ public sealed class InkCanvasControl : Control
         if (samples.Count == 1)
         {
             // A tap leaves a dot sized like the start of a stroke.
-            double radius = _widthModel.FromPressure(samples[0].Pressure) / 2;
-            context.DrawEllipse(InkBrush, null, new Point(samples[0].X, samples[0].Y), radius, radius);
+            double radius = (_widthModel.FromPressure(samples[0].Pressure) + widthPad) / 2;
+            context.DrawEllipse(brush, null, new Point(samples[0].X, samples[0].Y), radius, radius);
             return;
         }
 
         IReadOnlyList<double> widths = _widthModel.ComputeWidths(stroke, usePressure);
         for (int i = 1; i < samples.Count; i++)
         {
-            double width = (widths[i - 1] + widths[i]) / 2;
-            var pen = new Pen(InkBrush, width) { LineCap = PenLineCap.Round, LineJoin = PenLineJoin.Round };
+            double width = (widths[i - 1] + widths[i]) / 2 + widthPad;
+            var pen = new Pen(brush, width) { LineCap = PenLineCap.Round, LineJoin = PenLineJoin.Round };
             context.DrawLine(pen,
                 new Point(samples[i - 1].X, samples[i - 1].Y),
                 new Point(samples[i].X, samples[i].Y));
+        }
+    }
+
+    // 4.5c: an uncertain stroke draws desaturated and shivering — a small time-driven offset, phased
+    // per stroke id so neighbouring glitch strokes don't move in lockstep.
+    private void DrawGlitchStroke(DrawingContext context, Stroke stroke)
+    {
+        double t = _clock.Elapsed.TotalSeconds;
+        int hash = stroke.Id.GetHashCode();
+        double phaseX = (hash & 0xFF) / 255.0 * Math.PI * 2;
+        double phaseY = ((hash >> 8) & 0xFF) / 255.0 * Math.PI * 2;
+        double dx = GlitchAmplitude * Math.Sin(t * 2 * Math.PI * 2.1 + phaseX);
+        double dy = GlitchAmplitude * Math.Cos(t * 2 * Math.PI * 1.6 + phaseY);
+
+        using (context.PushTransform(Matrix.CreateTranslation(dx, dy)))
+        {
+            DrawStroke(context, stroke, UncertainBrush, widthPad: 0);
         }
     }
 
@@ -280,6 +415,9 @@ public sealed class InkCanvasControl : Control
             AddSample(point);
             e.Pointer.Capture(this);
             e.Handled = true;
+
+            // 4.5b: any pending/in-flight live read no longer describes the page being drawn on.
+            DrawingStarted?.Invoke(this, EventArgs.Empty);
         }
     }
 
@@ -323,17 +461,52 @@ public sealed class InkCanvasControl : Control
 
         if (_activeSamples is not null)
         {
-            if (_activeSamples.Count > 0)
-            {
-                // Store the raw stroke. The recognizer and glyph bank consume Document.Strokes, so they
-                // get the pen data as captured; the canvas smooths only for display (see _smoothCache).
-                Document?.AddStroke(new Stroke(Guid.NewGuid(), _activeSamples));
-            }
-
+            List<StrokeSample> samples = _activeSamples;
             _activeSamples = null;
             e.Pointer.Capture(null);
+
+            if (samples.Count > 0)
+            {
+                // 4.5d: a tap landing ON the played answer is a provenance query, not ink — consume it.
+                // A tap anywhere else (e.g. a decimal point) still draws normally.
+                if (IsAnswerTap(samples))
+                {
+                    AnswerTapped?.Invoke(this, EventArgs.Empty);
+                }
+                else
+                {
+                    // Store the raw stroke. The recognizer and glyph bank consume Document.Strokes, so they
+                    // get the pen data as captured; the canvas smooths only for display (see _smoothCache).
+                    Document?.AddStroke(new Stroke(Guid.NewGuid(), samples));
+                }
+            }
+
             InvalidateVisual();
         }
+    }
+
+    // A tap: every sample stays within the slop of the first (screen-space, so zoom-invariant), and the
+    // touch point lies on the answer's ink within tolerance. Only meaningful while an answer is shown.
+    private bool IsAnswerTap(IReadOnlyList<StrokeSample> samples)
+    {
+        if (_answer is null || samples.Count == 0)
+        {
+            return false;
+        }
+
+        double slopWorld = TapSlopScreenPx / _scale;
+        StrokeSample first = samples[0];
+        for (int i = 1; i < samples.Count; i++)
+        {
+            double dx = samples[i].X - first.X;
+            double dy = samples[i].Y - first.Y;
+            if (dx * dx + dy * dy > slopWorld * slopWorld)
+            {
+                return false;
+            }
+        }
+
+        return AnswerHitTester.HitTest(_answer.Strokes, first.X, first.Y, TapToleranceScreenPx / _scale);
     }
 
     // Pixels of pan per unit of wheel/scroll delta. Tuned so one mouse notch nudges the canvas a

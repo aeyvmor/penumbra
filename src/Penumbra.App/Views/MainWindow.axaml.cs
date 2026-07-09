@@ -15,6 +15,13 @@ public partial class MainWindow : Window
     public MainWindow()
     {
         InitializeComponent();
+
+        // 4.5b/4.5d: the canvas reports gestures; the view-model owns what they mean.
+        InkCanvas.DrawingStarted += (_, _) => ViewModel?.NotifyStrokeStarted();
+        InkCanvas.AnswerTapped += (_, _) => ViewModel?.ToggleAnswerProvenance();
+
+        // The view-model holds a live-recognition timer; closing the window must stop it.
+        Closed += (_, _) => (DataContext as IDisposable)?.Dispose();
     }
 
     private MainWindowViewModel? ViewModel => DataContext as MainWindowViewModel;

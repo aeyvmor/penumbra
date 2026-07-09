@@ -38,12 +38,22 @@
     "\\alpha",
     "\\leq",
     "\\geq",
-    "\\neq"
+    "\\neq",
+    "\\lt",
+    "s",
+    "i",
+    "o",
+    "g",
+    "l",
+    "m",
+    "e",
+    "t",
+    "d"
   ],
   "img_size": 32,
-  "mean": 0.09310410053468048,
-  "std": 0.2583702714316387,
-  "image_input": "1x1x32x32 grayscale, white ink on black, /255 then (v-mean)/std",
+  "mean": 0.0950692962453682,
+  "std": 0.26636036389744866,
+  "image_input": "1x1x32x32 grayscale, white ink on black, raw 0..1 coverage then (v-mean)/std; rasterizer = ml/common/raster.py == SymbolPreprocessor.RenderImage (parity-fixed)",
   "feature_names": [
     "aspect",
     "rel_height",
@@ -59,18 +69,26 @@
     "stroke_count": "number of strokes in the symbol"
   },
   "feat_mean": [
-    -0.048674628138542175,
-    1.106834053993225,
-    1.1815448999404907,
-    0.5187830924987793,
-    1.3221008777618408
+    -0.058139484375715256,
+    1.1139261722564697,
+    1.1582560539245605,
+    0.5194520950317383,
+    1.3300707340240479
   ],
   "feat_std": [
-    0.44003358483314514,
-    1.1225833892822266,
-    2.068723440170288,
-    0.19003424048423767,
-    0.5166545510292053
+    0.4315098524093628,
+    1.1078609228134155,
+    2.010232925415039,
+    0.19023557007312775,
+    0.5217016935348511
   ],
-  "feature_input": "1x5; compute per formulas, then (f - feat_mean) / feat_std"
+  "feature_input": "1x5; compute per formulas, then (f - feat_mean) / feat_std",
+  "temperature": 1.3080000000000007,
+  "reject_energy_threshold": -2.764087200164795,
+  "min_confidence": 0.5924550294876099,
+  "bank_confidence": 0.9300000000000004,
+  "calibration_note": "confidence = max softmax(logits/T); energy = -T*logsumexp(logits/T); REJECT symbol when energy > reject_energy_threshold",
+  "seed": 20260705,
+  "val_acc": 91.93189405742265,
+  "test_acc": 89.59285869801873
 }
