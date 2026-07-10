@@ -33,6 +33,8 @@ Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Penumbra.Sheet", "src\Penum
 EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Penumbra.Sheet.Tests", "tests\Penumbra.Sheet.Tests\Penumbra.Sheet.Tests.csproj", "{7AAF8C0B-2EE6-449B-BAEC-113123D5DB2C}"
 EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Penumbra.App.Tests", "tests\Penumbra.App.Tests\Penumbra.App.Tests.csproj", "{956A5E7A-1961-491F-A5FA-EE9704CF6529}"
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|Any CPU = Debug|Any CPU
@@ -199,6 +201,18 @@ Global
 		{7AAF8C0B-2EE6-449B-BAEC-113123D5DB2C}.Release|x64.Build.0 = Release|Any CPU
 		{7AAF8C0B-2EE6-449B-BAEC-113123D5DB2C}.Release|x86.ActiveCfg = Release|Any CPU
 		{7AAF8C0B-2EE6-449B-BAEC-113123D5DB2C}.Release|x86.Build.0 = Release|Any CPU
+		{956A5E7A-1961-491F-A5FA-EE9704CF6529}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{956A5E7A-1961-491F-A5FA-EE9704CF6529}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{956A5E7A-1961-491F-A5FA-EE9704CF6529}.Debug|x64.ActiveCfg = Debug|Any CPU
+		{956A5E7A-1961-491F-A5FA-EE9704CF6529}.Debug|x64.Build.0 = Debug|Any CPU
+		{956A5E7A-1961-491F-A5FA-EE9704CF6529}.Debug|x86.ActiveCfg = Debug|Any CPU
+		{956A5E7A-1961-491F-A5FA-EE9704CF6529}.Debug|x86.Build.0 = Debug|Any CPU
+		{956A5E7A-1961-491F-A5FA-EE9704CF6529}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{956A5E7A-1961-491F-A5FA-EE9704CF6529}.Release|Any CPU.Build.0 = Release|Any CPU
+		{956A5E7A-1961-491F-A5FA-EE9704CF6529}.Release|x64.ActiveCfg = Release|Any CPU
+		{956A5E7A-1961-491F-A5FA-EE9704CF6529}.Release|x64.Build.0 = Release|Any CPU
+		{956A5E7A-1961-491F-A5FA-EE9704CF6529}.Release|x86.ActiveCfg = Release|Any CPU
+		{956A5E7A-1961-491F-A5FA-EE9704CF6529}.Release|x86.Build.0 = Release|Any CPU
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE
@@ -217,5 +231,6 @@ Global
 		{793A7AF9-D05F-4E6B-80DA-D4AE73670117} = {0AB3BF05-4346-4AA6-1389-037BE0695223}
 		{45D79798-91EE-48AD-BDAC-5D23D95A8125} = {827E0CD3-B72D-47B6-A68D-7590B98EB39B}
 		{7AAF8C0B-2EE6-449B-BAEC-113123D5DB2C} = {0AB3BF05-4346-4AA6-1389-037BE0695223}
+		{956A5E7A-1961-491F-A5FA-EE9704CF6529} = {0AB3BF05-4346-4AA6-1389-037BE0695223}
 	EndGlobalSection
 EndGlobal

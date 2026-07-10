@@ -15,15 +15,22 @@ namespace Penumbra.App.Controls;
 /// The drawing surface. Captures pointer samples <c>(x, y, t, pressure)</c> into strokes, renders them
 /// with pressure/velocity-driven width, and supports an infinite pannable, zoomable canvas. Strokes are
 /// kept in world coordinates; a single scale+translate maps world to screen for both drawing and input.
-/// Left button draws; right/middle button pans; the wheel zooms about the cursor.
+/// Left button draws or erases according to the toolbar tool; pen eraser/inversion always erases;
+/// right/middle button pans; the wheel zooms about the cursor.
 /// </summary>
 public sealed class InkCanvasControl : Control
 {
     public static readonly StyledProperty<InkDocument?> DocumentProperty =
         AvaloniaProperty.Register<InkCanvasControl, InkDocument?>(nameof(Document));
 
-    public static readonly StyledProperty<AnswerAnimation?> AnswerAnimationProperty =
-        AvaloniaProperty.Register<InkCanvasControl, AnswerAnimation?>(nameof(AnswerAnimation));
+    public static readonly StyledProperty<AnswerLayer?> AnswerLayerProperty =
+        AvaloniaProperty.Register<InkCanvasControl, AnswerLayer?>(nameof(AnswerLayer));
+
+    public static readonly StyledProperty<CausalityRipple?> CausalityRippleProperty =
+        AvaloniaProperty.Register<InkCanvasControl, CausalityRipple?>(nameof(CausalityRipple));
+
+    public static readonly StyledProperty<bool> IsEraseModeProperty =
+        AvaloniaProperty.Register<InkCanvasControl, bool>(nameof(IsEraseMode));
 
     // 4.5c: strokes the recognizer can't stand behind — rendered desaturated + shivering.
     public static readonly StyledProperty<IReadOnlySet<Guid>?> UncertainStrokeIdsProperty =
@@ -37,7 +44,7 @@ public sealed class InkCanvasControl : Control
     public event EventHandler? DrawingStarted;
 
     /// <summary>4.5d: the user tapped the played answer (the tap is consumed, not inked).</summary>
-    public event EventHandler? AnswerTapped;
+    public event EventHandler<AnswerTappedEventArgs>? AnswerTapped;
 
     // Wall-clock → animation-time multiplier. Captured pen pace can feel sluggish; bump this to speed up the
     // "write-itself" playback. One named knob so tuning later is a single-line change.
@@ -50,6 +57,9 @@ public sealed class InkCanvasControl : Control
     // stay within the slop, and the tap counts only if it lands within the tolerance of answer ink.
     private const double TapSlopScreenPx = 6;
     private const double TapToleranceScreenPx = 12;
+    private const double EraserToleranceScreenPx = 14;
+    private static readonly TimeSpan RippleStepDuration = TimeSpan.FromMilliseconds(150);
+    private static readonly TimeSpan RippleHoldDuration = TimeSpan.FromMilliseconds(260);
 
     // 4.5c glitch: subtle shiver, in world units. Slow and small on purpose — "unsettled", not "alarm".
     private const double GlitchAmplitude = 1.4;
@@ -62,15 +72,18 @@ public sealed class InkCanvasControl : Control
 
     // Amber underlay for provenance-highlighted strokes.
     private static readonly IImmutableSolidColorBrush GlowBrush = new ImmutableSolidColorBrush(Color.FromArgb(0x55, 0xF5, 0x9E, 0x0B));
+    private static readonly IImmutableSolidColorBrush RippleBrush = new ImmutableSolidColorBrush(Color.FromArgb(0x66, 0x38, 0xB2, 0xAC));
 
     private readonly Stopwatch _clock = Stopwatch.StartNew();
     private readonly StrokeWidthModel _widthModel = new();
 
-    // The currently-playing answer layer (rendered on top of the document ink, never folded into it), the
-    // wall-clock instant playback began, and the ticking repaint timer (null when idle or finished).
-    private SynthesizedHandwriting? _answer;
-    private TimeSpan _answerStart;
+    // Owner-keyed answer playback lives above document ink and is never folded into it. One shared repaint
+    // timer services every concurrently playing entry; finished entries remain at their final frame.
+    private readonly Dictionary<Guid, AnswerPlayback> _answers = new();
     private DispatcherTimer? _answerTimer;
+    private CausalityRipple? _ripple;
+    private TimeSpan _rippleStart;
+    private DispatcherTimer? _rippleTimer;
 
     // Ticks repaints while any stroke is glitching (4.5c); null when the uncertain set is empty.
     private DispatcherTimer? _glitchTimer;
@@ -87,6 +100,7 @@ public sealed class InkCanvasControl : Control
     // Active stroke being drawn (world coordinates), or null when not drawing.
     private List<StrokeSample>? _activeSamples;
     private TimeSpan _strokeStart;
+    private HashSet<Guid>? _eraseHits;
 
     // Panning state.
     private bool _isPanning;
@@ -105,11 +119,23 @@ public sealed class InkCanvasControl : Control
         set => SetValue(DocumentProperty, value);
     }
 
-    /// <summary>The answer layer to play on top of the ink, or null for none. Set by the view-model on Recognize.</summary>
-    public AnswerAnimation? AnswerAnimation
+    /// <summary>All owner-keyed answers to render above document ink.</summary>
+    public AnswerLayer? AnswerLayer
     {
-        get => GetValue(AnswerAnimationProperty);
-        set => SetValue(AnswerAnimationProperty, value);
+        get => GetValue(AnswerLayerProperty);
+        set => SetValue(AnswerLayerProperty, value);
+    }
+
+    public CausalityRipple? CausalityRipple
+    {
+        get => GetValue(CausalityRippleProperty);
+        set => SetValue(CausalityRippleProperty, value);
+    }
+
+    public bool IsEraseMode
+    {
+        get => GetValue(IsEraseModeProperty);
+        set => SetValue(IsEraseModeProperty, value);
     }
 
     /// <summary>Strokes rendered as glitch-ink (4.5c), or null/empty for none.</summary>
@@ -144,9 +170,13 @@ public sealed class InkCanvasControl : Control
 
             InvalidateVisual();
         }
-        else if (change.Property == AnswerAnimationProperty)
+        else if (change.Property == AnswerLayerProperty)
         {
-            OnAnswerAnimationChanged(change.NewValue as AnswerAnimation);
+            OnAnswerLayerChanged(change.NewValue as AnswerLayer);
+        }
+        else if (change.Property == CausalityRippleProperty)
+        {
+            OnCausalityRippleChanged(change.NewValue as CausalityRipple);
         }
         else if (change.Property == UncertainStrokeIdsProperty)
         {
@@ -162,24 +192,48 @@ public sealed class InkCanvasControl : Control
 
     // --- Answer animation ------------------------------------------------------------------------
 
-    private void OnAnswerAnimationChanged(AnswerAnimation? animation)
+    private void OnAnswerLayerChanged(AnswerLayer? layer)
     {
-        // Always stop the previous run first so replacing an animation never leaks a running timer.
-        StopAnswerTimer();
-
-        _answer = animation?.Handwriting;
-        if (_answer is null)
+        HashSet<Guid> incoming = layer?.Answers.Select(answer => answer.OwnerId).ToHashSet() ?? new();
+        foreach (Guid removed in _answers.Keys.Where(id => !incoming.Contains(id)).ToArray())
         {
-            InvalidateVisual();
+            _answers.Remove(removed);
+        }
+
+        foreach (AnswerAnimation answer in layer?.Answers ?? Array.Empty<AnswerAnimation>())
+        {
+            if (_answers.TryGetValue(answer.OwnerId, out AnswerPlayback? current)
+                && current.Animation.Sequence == answer.Sequence)
+            {
+                continue;
+            }
+
+            TimeSpan start = answer.Play
+                ? _clock.Elapsed
+                : _clock.Elapsed - answer.Handwriting.Timeline.TotalDuration / PlaybackSpeed;
+            _answers[answer.OwnerId] = new AnswerPlayback(answer, start);
+        }
+
+        EnsureAnswerTimer();
+        InvalidateVisual();
+    }
+
+    private void EnsureAnswerTimer()
+    {
+        bool playing = _answers.Values.Any(answer =>
+            AnswerElapsed(answer) < answer.Animation.Handwriting.Timeline.TotalDuration);
+        if (!playing)
+        {
+            StopAnswerTimer();
             return;
         }
 
-        // Anchor playback to "now"; Render maps elapsed wall-clock (× speed) onto the timeline.
-        _answerStart = _clock.Elapsed;
-        _answerTimer = new DispatcherTimer { Interval = FrameInterval };
-        _answerTimer.Tick += OnAnswerTick;
-        _answerTimer.Start();
-        InvalidateVisual();
+        if (_answerTimer is null)
+        {
+            _answerTimer = new DispatcherTimer { Interval = FrameInterval };
+            _answerTimer.Tick += OnAnswerTick;
+            _answerTimer.Start();
+        }
     }
 
     private void OnAnswerTick(object? sender, EventArgs e)
@@ -188,13 +242,14 @@ public sealed class InkCanvasControl : Control
 
         // Once the whole timeline has played, stop ticking but KEEP _answer so Render holds the final frame
         // (SampleAt clamps past TotalDuration), leaving the finished answer on the page.
-        if (_answer is null || AnswerElapsed() >= _answer.Timeline.TotalDuration)
+        if (_answers.Values.All(answer =>
+            AnswerElapsed(answer) >= answer.Animation.Handwriting.Timeline.TotalDuration))
         {
             StopAnswerTimer();
         }
     }
 
-    private TimeSpan AnswerElapsed() => (_clock.Elapsed - _answerStart) * PlaybackSpeed;
+    private TimeSpan AnswerElapsed(AnswerPlayback answer) => (_clock.Elapsed - answer.Start) * PlaybackSpeed;
 
     private void StopAnswerTimer()
     {
@@ -206,6 +261,40 @@ public sealed class InkCanvasControl : Control
         _answerTimer.Stop();
         _answerTimer.Tick -= OnAnswerTick;
         _answerTimer = null;
+    }
+
+    private void OnCausalityRippleChanged(CausalityRipple? ripple)
+    {
+        StopRippleTimer();
+        _ripple = ripple;
+        if (ripple is not null)
+        {
+            _rippleStart = _clock.Elapsed;
+            _rippleTimer = new DispatcherTimer { Interval = FrameInterval };
+            _rippleTimer.Tick += OnRippleTick;
+            _rippleTimer.Start();
+        }
+
+        InvalidateVisual();
+    }
+
+    private void OnRippleTick(object? sender, EventArgs e)
+    {
+        InvalidateVisual();
+        if (_ripple is null
+            || _clock.Elapsed - _rippleStart >= RippleStepDuration * _ripple.Steps.Count + RippleHoldDuration)
+        {
+            StopRippleTimer();
+            _ripple = null;
+        }
+    }
+
+    private void StopRippleTimer()
+    {
+        if (_rippleTimer is null) return;
+        _rippleTimer.Stop();
+        _rippleTimer.Tick -= OnRippleTick;
+        _rippleTimer = null;
     }
 
     // --- Glitch-ink (4.5c) -------------------------------------------------------------------------
@@ -249,6 +338,7 @@ public sealed class InkCanvasControl : Control
         base.OnDetachedFromVisualTree(e);
         StopAnswerTimer();   // don't leave timers running against a detached control.
         StopGlitchTimer();
+        StopRippleTimer();
     }
 
     // --- Rendering -------------------------------------------------------------------------------
@@ -281,6 +371,23 @@ public sealed class InkCanvasControl : Control
                     }
                 }
 
+                // Ripple is a short dependency-order glow over source ink. It has no persistence and is
+                // intentionally independent from the amber provenance selection and answer timelines.
+                if (_ripple is not null)
+                {
+                    double elapsed = (_clock.Elapsed - _rippleStart).TotalMilliseconds;
+                    for (int index = 0; index < _ripple.Steps.Count; index++)
+                    {
+                        double local = elapsed - RippleStepDuration.TotalMilliseconds * index;
+                        if (local < 0 || local > RippleHoldDuration.TotalMilliseconds) continue;
+                        IReadOnlySet<Guid> ids = _ripple.Steps[index].StrokeIds.ToHashSet();
+                        foreach (Stroke stroke in doc.Strokes.Where(stroke => ids.Contains(stroke.Id)))
+                        {
+                            DrawStroke(context, _smoothCache.GetSmoothed(stroke), RippleBrush, widthPad: 9);
+                        }
+                    }
+                }
+
                 foreach (Stroke stroke in doc.Strokes)
                 {
                     // Strokes are stored raw; draw the smoothed form (cached per id).
@@ -308,9 +415,9 @@ public sealed class InkCanvasControl : Control
             // The answer layer: replay the timeline up to the current instant, on top of the document ink and
             // in the SAME world transform (the synthesizer anchored these strokes at the '=' world bounds).
             // Reusing DrawStroke gives the answer the identical pressure/velocity width model as real ink.
-            if (_answer is not null)
+            foreach (AnswerPlayback answer in _answers.Values.OrderBy(entry => entry.Animation.Sequence))
             {
-                foreach (Stroke stroke in _answer.Timeline.SampleAt(AnswerElapsed()))
+                foreach (Stroke stroke in answer.Animation.Handwriting.Timeline.SampleAt(AnswerElapsed(answer)))
                 {
                     DrawStroke(context, stroke);
                 }
@@ -398,7 +505,10 @@ public sealed class InkCanvasControl : Control
         Focus();
         PointerPoint point = e.GetCurrentPoint(this);
 
-        if (point.Properties.IsRightButtonPressed || point.Properties.IsMiddleButtonPressed)
+        // Some platforms report an inverted/eraser pen tip together with a secondary-button state.
+        // Eraser identity wins there; ordinary right/middle input remains the pan gesture.
+        bool penEraser = point.Properties.IsEraser || point.Properties.IsInverted;
+        if (!penEraser && (point.Properties.IsRightButtonPressed || point.Properties.IsMiddleButtonPressed))
         {
             _isPanning = true;
             _lastPanX = point.Position.X;
@@ -408,11 +518,20 @@ public sealed class InkCanvasControl : Control
             return;
         }
 
-        if (point.Properties.IsLeftButtonPressed)
+        bool erase = IsEraseMode || penEraser;
+        if (point.Properties.IsLeftButtonPressed || erase)
         {
-            _activeSamples = new List<StrokeSample>();
             _strokeStart = _clock.Elapsed;
-            AddSample(point);
+            if (erase)
+            {
+                _eraseHits = new HashSet<Guid>();
+                AddEraseHit(point);
+            }
+            else
+            {
+                _activeSamples = new List<StrokeSample>();
+                AddSample(point);
+            }
             e.Pointer.Capture(this);
             e.Handled = true;
 
@@ -436,7 +555,13 @@ public sealed class InkCanvasControl : Control
             return;
         }
 
-        if (_activeSamples is not null)
+        if (_eraseHits is not null)
+        {
+            foreach (PointerPoint intermediate in e.GetIntermediatePoints(this)) AddEraseHit(intermediate);
+            AddEraseHit(point);
+            InvalidateVisual();
+        }
+        else if (_activeSamples is not null)
         {
             // Intermediate points recover the high-frequency samples coalesced into one move event.
             foreach (PointerPoint intermediate in e.GetIntermediatePoints(this))
@@ -459,7 +584,17 @@ public sealed class InkCanvasControl : Control
             return;
         }
 
-        if (_activeSamples is not null)
+        if (_eraseHits is not null)
+        {
+            HashSet<Guid> hits = _eraseHits;
+            _eraseHits = null;
+            e.Pointer.Capture(null);
+            // One pointer gesture is one document edit and therefore one undo step. Hit testing only ever
+            // receives display-smoothed document strokes; synthesized answer ink is not addressable here.
+            Document?.EraseStrokes(hits);
+            InvalidateVisual();
+        }
+        else if (_activeSamples is not null)
         {
             List<StrokeSample> samples = _activeSamples;
             _activeSamples = null;
@@ -469,9 +604,9 @@ public sealed class InkCanvasControl : Control
             {
                 // 4.5d: a tap landing ON the played answer is a provenance query, not ink — consume it.
                 // A tap anywhere else (e.g. a decimal point) still draws normally.
-                if (IsAnswerTap(samples))
+                if (AnswerOwnerAtTap(samples) is Guid ownerId)
                 {
-                    AnswerTapped?.Invoke(this, EventArgs.Empty);
+                    AnswerTapped?.Invoke(this, new AnswerTappedEventArgs(ownerId));
                 }
                 else
                 {
@@ -487,11 +622,11 @@ public sealed class InkCanvasControl : Control
 
     // A tap: every sample stays within the slop of the first (screen-space, so zoom-invariant), and the
     // touch point lies on the answer's ink within tolerance. Only meaningful while an answer is shown.
-    private bool IsAnswerTap(IReadOnlyList<StrokeSample> samples)
+    private Guid? AnswerOwnerAtTap(IReadOnlyList<StrokeSample> samples)
     {
-        if (_answer is null || samples.Count == 0)
+        if (_answers.Count == 0 || samples.Count == 0)
         {
-            return false;
+            return null;
         }
 
         double slopWorld = TapSlopScreenPx / _scale;
@@ -502,11 +637,19 @@ public sealed class InkCanvasControl : Control
             double dy = samples[i].Y - first.Y;
             if (dx * dx + dy * dy > slopWorld * slopWorld)
             {
-                return false;
+                return null;
             }
         }
 
-        return AnswerHitTester.HitTest(_answer.Strokes, first.X, first.Y, TapToleranceScreenPx / _scale);
+        // Latest sequence is visually topmost and therefore owns an overlap tap.
+        return _answers.Values
+            .OrderByDescending(answer => answer.Animation.Sequence)
+            .FirstOrDefault(answer => AnswerHitTester.HitTest(
+                answer.Animation.Handwriting.Strokes,
+                first.X,
+                first.Y,
+                TapToleranceScreenPx / _scale))
+            ?.Animation.OwnerId;
     }
 
     // Pixels of pan per unit of wheel/scroll delta. Tuned so one mouse notch nudges the canvas a
@@ -554,4 +697,19 @@ public sealed class InkCanvasControl : Control
         TimeSpan time = _clock.Elapsed - _strokeStart;
         _activeSamples!.Add(new StrokeSample(worldX, worldY, time, point.Properties.Pressure));
     }
+
+    private void AddEraseHit(PointerPoint point)
+    {
+        if (Document is not { } document || _eraseHits is null) return;
+        double worldX = (point.Position.X - _offsetX) / _scale;
+        double worldY = (point.Position.Y - _offsetY) / _scale;
+        Stroke[] displayed = document.Strokes.Select(_smoothCache.GetSmoothed).ToArray();
+        _eraseHits.UnionWith(StrokeHitTester.HitTest(
+            displayed,
+            worldX,
+            worldY,
+            EraserToleranceScreenPx / _scale));
+    }
+
+    private sealed record AnswerPlayback(AnswerAnimation Animation, TimeSpan Start);
 }

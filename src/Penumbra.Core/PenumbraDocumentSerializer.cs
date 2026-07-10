@@ -3,28 +3,25 @@ using System.Text.Json;
 namespace Penumbra.Core;
 
 /// <summary>
-/// Reads and writes <see cref="PenumbraDocument"/> as JSON — the on-disk <c>.pen</c> format. Kept here in
+/// Reads and writes <see cref="PenumbraDocument"/> as JSON—the on-disk <c>.pen</c> format. Kept here in
 /// Core (alongside the document model, with no UI dependency) so persistence can be unit-tested headless.
-/// The document's own <see cref="PenumbraDocument.Version"/> carries the schema version for future migration.
+/// The document's own <see cref="PenumbraDocument.Version"/> carries the schema version for migration.
 /// <para>
 /// Schema history:
 /// <list type="bullet">
-///   <item><description><b>v1</b> — <see cref="Stroke.Samples"/> held the <em>smoothed</em> polyline
-///   (the canvas smoothed before storing). v1 files still load as-is; their strokes stay smoothed, which
-///   is acceptable for display but is why they are not first-class corpus/recognizer parity material.</description></item>
-///   <item><description><b>v2</b> — <see cref="Stroke.Samples"/> holds the <em>raw</em> pen data as
-///   captured; smoothing moved to render time. No field changed shape — v2 is purely a semantic change of
-///   what <c>Samples</c> means. Loading a v1 file leaves its <c>Version</c> at 1 (no in-place migration).</description></item>
+///   <item><description><b>v1</b>—<see cref="Stroke.Samples"/> held the <em>smoothed</em> polyline.
+///   These files still load as-is and retain Version 1.</description></item>
+///   <item><description><b>v2</b>—<see cref="Stroke.Samples"/> holds raw captured pen data; smoothing
+///   moved to render time. The persisted shape did not otherwise change.</description></item>
+///   <item><description><b>v3</b>—adds neutral per-region recognition and result snapshots. Raw
+///   strokes remain the source of truth; dependencies and transient rendering state are rebuilt.</description></item>
 /// </list>
 /// </para>
 /// </summary>
 public static class PenumbraDocumentSerializer
 {
-    /// <summary>
-    /// Current on-disk schema version. Bump when the persisted shape or meaning changes incompatibly.
-    /// v2: <see cref="Stroke.Samples"/> is raw pen data (v1 stored smoothed). See the type summary.
-    /// </summary>
-    public const int SchemaVersion = 2;
+    /// <summary>Current on-disk schema version.</summary>
+    public const int SchemaVersion = 3;
 
     private static readonly JsonSerializerOptions Options = new()
     {
@@ -35,29 +32,111 @@ public static class PenumbraDocumentSerializer
     public static PenumbraDocument CreateEmpty() => new(
         Array.Empty<Stroke>(),
         new Dictionary<string, string>(),
-        SchemaVersion);
+        SchemaVersion,
+        Array.Empty<PersistedRegion>());
 
     /// <summary>Serializes a document to indented JSON.</summary>
-    public static string Serialize(PenumbraDocument document) =>
-        JsonSerializer.Serialize(document, Options);
+    public static string Serialize(PenumbraDocument document)
+    {
+        ArgumentNullException.ThrowIfNull(document);
+        ValidateVersion(document.Version);
+        return JsonSerializer.Serialize(Normalize(document), Options);
+    }
 
-    /// <summary>Parses a document from JSON produced by <see cref="Serialize"/>.</summary>
-    public static PenumbraDocument Deserialize(string json) =>
-        JsonSerializer.Deserialize<PenumbraDocument>(json, Options)
-        ?? throw new FormatException("Document JSON deserialized to null.");
+    /// <summary>Parses and validates a supported document from JSON.</summary>
+    public static PenumbraDocument Deserialize(string json)
+    {
+        PenumbraDocument document = JsonSerializer.Deserialize<PenumbraDocument>(json, Options)
+            ?? throw new FormatException("Document JSON deserialized to null.");
+        ValidateVersion(document.Version);
+        return Normalize(document);
+    }
 
     /// <summary>Writes a document to a <c>.pen</c> file.</summary>
     public static async Task SaveAsync(PenumbraDocument document, string path, CancellationToken ct = default)
     {
+        ArgumentNullException.ThrowIfNull(document);
+        ValidateVersion(document.Version);
         await using FileStream stream = File.Create(path);
-        await JsonSerializer.SerializeAsync(stream, document, Options, ct);
+        await JsonSerializer.SerializeAsync(stream, Normalize(document), Options, ct);
     }
 
-    /// <summary>Reads a document from a <c>.pen</c> file.</summary>
+    /// <summary>Reads and validates a supported document from a <c>.pen</c> file.</summary>
     public static async Task<PenumbraDocument> LoadAsync(string path, CancellationToken ct = default)
     {
         await using FileStream stream = File.OpenRead(path);
-        return await JsonSerializer.DeserializeAsync<PenumbraDocument>(stream, Options, ct)
+        PenumbraDocument document = await JsonSerializer.DeserializeAsync<PenumbraDocument>(stream, Options, ct)
             ?? throw new FormatException($"Document at '{path}' deserialized to null.");
+        ValidateVersion(document.Version);
+        return Normalize(document);
     }
+
+    private static void ValidateVersion(int version)
+    {
+        // Silently accepting a future schema could discard semantics this build does not know how to
+        // reconstruct. Honest failure is safer than opening a page with plausible stale answers.
+        if (version < 1 || version > SchemaVersion)
+        {
+            throw new NotSupportedException(
+                $"Unsupported .pen schema version {version}. Supported versions are 1 through {SchemaVersion}.");
+        }
+    }
+
+    private static PenumbraDocument Normalize(PenumbraDocument document)
+    {
+        IReadOnlyList<PersistedRegion> regions = (document.Regions ?? Array.Empty<PersistedRegion>())
+            .Where(region => region is not null)
+            .Select(Normalize)
+            .ToArray();
+
+        // System.Text.Json can supply null for absent collection properties even when the public
+        // contract is annotated non-null. Normalize at the persistence boundary so downstream code
+        // gets safe empty collections while stroke/sample values themselves stay untouched.
+        return document with
+        {
+            Strokes = document.Strokes ?? Array.Empty<Stroke>(),
+            Variables = document.Variables ?? new Dictionary<string, string>(),
+            Regions = regions,
+        };
+    }
+
+    private static PersistedRegion Normalize(PersistedRegion region)
+    {
+        PersistedRecognition recognition = region.Recognition ?? new PersistedRecognition(
+            string.Empty,
+            Array.Empty<RecognizedToken>(),
+            0,
+            0);
+
+        recognition = recognition with
+        {
+            Latex = recognition.Latex ?? string.Empty,
+            Tokens = (recognition.Tokens ?? Array.Empty<RecognizedToken>())
+                .Where(token => token is not null)
+                .Select(Normalize)
+                .ToArray(),
+        };
+
+        PersistedNodeResult? result = region.NodeResult is null
+            ? null
+            : region.NodeResult with
+            {
+                Latex = region.NodeResult.Latex ?? string.Empty,
+                DisplayText = region.NodeResult.DisplayText ?? string.Empty,
+                Kind = region.NodeResult.Kind ?? string.Empty,
+            };
+
+        return region with
+        {
+            StrokeIds = region.StrokeIds ?? Array.Empty<Guid>(),
+            Recognition = recognition,
+            NodeResult = result,
+        };
+    }
+
+    private static RecognizedToken Normalize(RecognizedToken token) => token with
+    {
+        Latex = token.Latex ?? string.Empty,
+        SourceStrokeIds = token.SourceStrokeIds ?? Array.Empty<Guid>(),
+    };
 }

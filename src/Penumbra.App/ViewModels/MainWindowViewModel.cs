@@ -3,132 +3,117 @@ using CommunityToolkit.Mvvm.ComponentModel;
 using CommunityToolkit.Mvvm.Input;
 using Penumbra.Cas;
 using Penumbra.Core;
-using Penumbra.Graphing;
 using Penumbra.Ink;
 using Penumbra.Recognition;
+using Penumbra.Sheet;
 
 namespace Penumbra.App.ViewModels;
 
+/// <summary>
+/// Owns one page's raw ink, incremental recognition cache, reactive Sheet graph, and transient visuals.
+/// The ownership boundary is deliberate: recognition output may enter Sheet, while synthesized answers
+/// and causality ripples are overlay state and can never become recognizer input.
+/// </summary>
 public partial class MainWindowViewModel : ViewModelBase, IDisposable
 {
-    private static readonly IReadOnlyDictionary<string, string> NoVariables = new Dictionary<string, string>();
     private static readonly IReadOnlySet<Guid> NoStrokes = new HashSet<Guid>();
-    private const string IdleHint = "Write an expression ending in '=' — it answers when you pause";
+    private const string IdleHint = "Write expressions on separate lines — queries ending in '=' answer when you pause";
 
-    /// <summary>
-    /// The recognizer's decision contract (audit B4): the reject bar (<c>MinConfidence</c> — reads whose
-    /// weakest symbol scores below it are refused) and the stricter banking bar (<c>BankConfidence</c>);
-    /// temperature scaling and energy rejection are applied inside the classifier itself. Injected from
-    /// the model's meta.json via DI so the bars always match the confidences that model actually
-    /// produces; <see cref="RecognitionCalibration.Default"/> (reject 0.55, bank 0.80 — the pre-B4
-    /// hardcoded constants) for design time and models whose meta predates calibration.
-    /// </summary>
-    private readonly RecognitionCalibration _calibration = RecognitionCalibration.Default;
-
-    /// <summary>
-    /// 4.5b: how long the pen must stay up before a live read fires. Tuned by dogfood: 600 ms fired
-    /// between the two strokes of a '+' (mouse repositioning gaps run 600–900 ms), glitching the
-    /// half-drawn symbol mid-writing. If the pen retest still trips this, the designed escalation is
-    /// a two-tier debounce (read fast, show glitch/reject UX only after a longer quiet), not more delay.
-    /// </summary>
     internal static readonly TimeSpan LiveQuietPeriod = TimeSpan.FromSeconds(1);
 
-    private readonly IRecognizer _recognizer;
-    private readonly IEvaluator? _evaluator;
+    // s19 dogfood: an erase is usually the first half of "erase, then rewrite". Recomputing on the
+    // normal quiet period races the user — the half-edited line ('x=' with its value gone) recognizes,
+    // ripples the whole dependency chain, then everything recomputes AGAIN when the new value lands.
+    // Stroke-removing edits therefore get a longer window; pen-down still cancels it instantly.
+    internal static readonly TimeSpan EraseQuietPeriod = TimeSpan.FromSeconds(2.2);
+
+    private readonly IRegionRecognizer _regionRecognizer;
+    private readonly SheetGraph _sheet;
     private readonly IGlyphBank? _glyphBank;
     private readonly HandwritingSynthesizer? _synthesizer;
+    private readonly RecognitionCalibration _calibration;
     private readonly Debouncer _liveDebouncer;
-
-    // 4.5b corpus-poison guard: the stroke-sets already banked this page, so re-reads never re-bank
-    // the same physical ink (see GlyphCapture dedup overload). Cleared when the page empties.
     private readonly HashSet<string> _bankedStrokeSets = new();
 
-    // The in-flight read's cancellation, superseded by every newer read and by pen-down.
+    // This list is the recognizer's complete round-trip state, including rejected regions. It is replaced
+    // only by an atomically applied latest pass; a cancelled/superseded result never becomes cache authority.
+    private IReadOnlyList<RegionRecognition> _previousRegions = Array.Empty<RegionRecognition>();
     private CancellationTokenSource? _recognitionCts;
-
-    // Bumped on every animation so the freshly-built AnswerAnimation never compares equal to the last one,
-    // guaranteeing the canvas's styled property fires even for a re-computed identical answer.
-    private long _animationSequence;
-
-    // What the current AnswerAnimation shows, as (recognized latex, answer text) — live re-reads of the
-    // same line skip re-playing an identical answer (an unrelated edit elsewhere must not replay it).
-    private (string Latex, string Answer)? _lastAnimated;
-
-    // Seam-1 tokens behind the displayed answer — the ghost-trace provenance source (4.5d).
-    private IReadOnlyList<RecognizedToken> _lastAnsweredTokens = Array.Empty<RecognizedToken>();
+    private long _recognitionGeneration;
+    private long _visualSequence;
+    private bool _suppressDocumentChanged;
+    private int _lastKnownStrokeCount;
+    private bool _disposed;
 
     public MainWindowViewModel()
+        : this(
+            new EmptyRegionRecognizer(),
+            new SheetGraph(new AngouriMathEvaluator(), new AngouriMathExpressionAnalyzer()),
+            glyphBank: null,
+            synthesizer: null,
+            calibration: RecognitionCalibration.Default)
     {
-        Document = new InkDocument();
-        Document.Changed += (_, _) => OnDocumentChanged();
-        _recognizer = new NoOpRecognizer();   // design-time fallback; DI overrides below
-
-        // The debouncer fires on a timer thread; recognition + all state changes belong to the UI thread.
-        _liveDebouncer = new Debouncer(
-            LiveQuietPeriod,
-            () => Dispatcher.UIThread.Post(() => _ = RecognizeCoreAsync(manual: false)));
     }
 
     public MainWindowViewModel(
-        IEvaluator evaluator,
-        IRecognizer recognizer,
-        IGraphDetector graphDetector,
+        IRegionRecognizer regionRecognizer,
+        SheetGraph sheet,
         IGlyphBank? glyphBank = null,
         HandwritingSynthesizer? synthesizer = null,
         RecognitionCalibration? calibration = null)
-        : this()
     {
-        ArgumentNullException.ThrowIfNull(evaluator);
-        ArgumentNullException.ThrowIfNull(recognizer);
-        ArgumentNullException.ThrowIfNull(graphDetector);
-        _recognizer = recognizer;
-        _evaluator = evaluator;
+        ArgumentNullException.ThrowIfNull(regionRecognizer);
+        ArgumentNullException.ThrowIfNull(sheet);
+
+        _regionRecognizer = regionRecognizer;
+        _sheet = sheet;
         _glyphBank = glyphBank;
         _synthesizer = synthesizer;
         _calibration = calibration ?? RecognitionCalibration.Default;
+
+        Document = new InkDocument();
+        Document.Changed += (_, _) => OnDocumentChanged();
+        _liveDebouncer = new Debouncer(
+            LiveQuietPeriod,
+            () => Dispatcher.UIThread.Post(() => _ = RecognizeCoreAsync(RecognitionMode.Live)));
     }
 
-    /// <summary>The page being drawn on; owns the strokes and the undo/redo history.</summary>
     public InkDocument Document { get; }
 
-    /// <summary>What the recognizer last read / computed (shown under the canvas).</summary>
+    /// <summary>Read-only graph exposure for diagnostics and persistence; mutations remain transactional here.</summary>
+    public IReadOnlyCollection<SheetNode> SheetNodes => _sheet.Nodes;
+
     [ObservableProperty]
     private string _recognitionText = IdleHint;
 
-    /// <summary>
-    /// The answer layer the canvas plays on top of the ink, or null when there's nothing to animate.
-    /// Deliberately separate from <see cref="Document"/> so synthesized ink never re-enters recognition.
-    /// </summary>
+    /// <summary>Immutable owner-keyed answer overlay, always separate from <see cref="Document"/>.</summary>
     [ObservableProperty]
-    private AnswerAnimation? _answerAnimation;
+    private AnswerLayer _answerLayer = AnswerLayer.Empty;
 
-    /// <summary>4.5b: recognize automatically a beat after pen-lift. The button remains as a manual re-read.</summary>
+    [ObservableProperty]
+    private CausalityRipple? _causalityRipple;
+
     [ObservableProperty]
     private bool _liveRecognition = true;
 
-    /// <summary>4.5c: strokes of below-threshold symbols; the canvas renders them as glitch-ink.</summary>
+    /// <summary>Explicit mouse tool; pen eraser/inversion is detected directly by the canvas.</summary>
+    [ObservableProperty]
+    private bool _isEraseMode;
+
     [ObservableProperty]
     private IReadOnlySet<Guid> _uncertainStrokeIds = NoStrokes;
 
-    /// <summary>4.5d: strokes to highlight as the displayed answer's provenance (empty = no highlight).</summary>
     [ObservableProperty]
     private IReadOnlySet<Guid> _provenanceStrokeIds = NoStrokes;
 
-    /// <summary>
-    /// 4.5b: the pen touched down. A pending or in-flight read is stale by construction — its snapshot
-    /// misses the stroke being drawn — and an answer materializing mid-stroke is jank, so both die here.
-    /// </summary>
     public void NotifyStrokeStarted()
     {
         _liveDebouncer.Cancel();
-        _recognitionCts?.Cancel();
+        CancelRecognition();
     }
 
-    /// <summary>
-    /// 4.5d: tap on the played answer — toggle the highlight of the ink it was recognized from.
-    /// Seam 1 makes this a set-union: every answered token knows its source strokes.
-    /// </summary>
-    public void ToggleAnswerProvenance()
+    /// <summary>Toggles provenance for one answer owner; overlapping answers never borrow another line's tokens.</summary>
+    public void ToggleAnswerProvenance(Guid ownerId)
     {
         if (ProvenanceStrokeIds.Count > 0)
         {
@@ -136,153 +121,237 @@ public partial class MainWindowViewModel : ViewModelBase, IDisposable
             return;
         }
 
-        var ids = new HashSet<Guid>();
-        foreach (RecognizedToken token in _lastAnsweredTokens)
-        {
-            foreach (Guid id in token.SourceStrokeIds)
-            {
-                ids.Add(id);
-            }
-        }
-
-        ProvenanceStrokeIds = ids;
+        SheetNode? node = _sheet.Find(ownerId);
+        ProvenanceStrokeIds = node is null
+            ? NoStrokes
+            : node.Tokens.SelectMany(token => token.SourceStrokeIds).ToHashSet();
     }
 
     [RelayCommand(CanExecute = nameof(CanRecognize))]
-    private Task Recognize() => RecognizeCoreAsync(manual: true);
+    private Task Recognize() => RecognizeCoreAsync(RecognitionMode.Manual);
 
-    /// <summary>
-    /// The one recognition path (button and live debounce both land here). Snapshots the strokes —
-    /// <see cref="InkDocument.Strokes"/> is the live list and this leaves the UI thread — starts a
-    /// fresh cancellation scope that supersedes any older read, and applies the result unless a newer
-    /// read (or pen-down) cancelled it first.
-    /// </summary>
-    private async Task RecognizeCoreAsync(bool manual)
+    /// <summary>Headless-friendly explicit read used by tests and non-command hosts.</summary>
+    public Task RecognizeNowAsync(bool manual = false) =>
+        RecognizeCoreAsync(manual ? RecognitionMode.Manual : RecognitionMode.Live);
+
+    private async Task RecognizeCoreAsync(RecognitionMode mode)
     {
-        if (Document.Strokes.Count == 0)
+        if (_disposed)
         {
             return;
         }
 
-        if (manual)
-        {
-            // Manual semantics predate live mode: a clicked re-read supersedes the playing answer up
-            // front, so every failure path below leaves a clean canvas. Live reads are gentler — they
-            // keep the last answer through transient mid-writing failures.
-            AnswerAnimation = null;
-            _lastAnimated = null;
-        }
-
-        _recognitionCts?.Cancel();
-        _recognitionCts?.Dispose();
+        CancelRecognition();
         var cts = new CancellationTokenSource();
         _recognitionCts = cts;
+        long generation = ++_recognitionGeneration;
 
-        Stroke[] snapshot = Document.Strokes.ToArray();
+        // Both collections are immutable snapshots while work runs off-thread. In particular, do not pass
+        // InkDocument.Strokes itself: pointer input may mutate it before segmentation finishes.
+        Stroke[] strokes = Document.Strokes.ToArray();
+        RegionRecognition[] previous = _previousRegions.ToArray();
 
-        RecognitionResult result;
+        IReadOnlyList<RegionRecognition> regions;
         try
         {
-            result = await _recognizer.RecognizeAsync(snapshot, cts.Token);
+            regions = await _regionRecognizer.RecognizeRegionsAsync(strokes, previous, cts.Token);
         }
         catch (OperationCanceledException)
         {
-            return;   // superseded — the newer read owns the UI
+            return;
         }
 
-        if (cts.Token.IsCancellationRequested)
+        // CancellationToken alone is insufficient when a fake/non-cooperative recognizer returns late.
+        // The generation check mechanically enforces latest-pass-wins before any cache/graph/UI mutation.
+        if (cts.IsCancellationRequested || generation != _recognitionGeneration || !ReferenceEquals(cts, _recognitionCts))
         {
             return;
         }
 
-        ApplyRecognition(result, snapshot, manual);
+        ApplyRegions(regions, strokes, mode);
     }
 
-    private void ApplyRecognition(RecognitionResult result, IReadOnlyList<Stroke> snapshot, bool manual)
+    private void ApplyRegions(
+        IReadOnlyList<RegionRecognition> regions,
+        IReadOnlyList<Stroke> strokeSnapshot,
+        RecognitionMode mode)
     {
-        // Any fresh read invalidates a provenance highlight — it described the previous answer.
+        var accepted = new Dictionary<Guid, RegionRecognition>();
+        var uncertain = new HashSet<Guid>();
+        foreach (RegionRecognition region in regions)
+        {
+            RecognitionGate.GateResult gate = RecognitionGate.Evaluate(region.Result, _calibration.MinConfidence);
+            if (!string.IsNullOrWhiteSpace(region.Result.Latex) && gate.Accepted)
+            {
+                accepted[region.Region.Id] = region;
+            }
+            else
+            {
+                uncertain.UnionWith(RecognitionGate.UncertainStrokeIds(region.Result, _calibration.MinConfidence));
+            }
+        }
+
+        // Apply the whole recognition snapshot as one Sheet transaction: upsert all accepted regions (clean
+        // ones included, because Y-position can change definition ownership), remove absent/rejected nodes,
+        // then recompute exactly once. Rejected state still round-trips above, but never feeds dependents.
+        foreach (Guid id in _sheet.Nodes.Select(node => node.Id).Where(id => !accepted.ContainsKey(id)).ToArray())
+        {
+            _sheet.Remove(id);
+        }
+
+        foreach (RegionRecognition region in regions.Where(r => accepted.ContainsKey(r.Region.Id)))
+        {
+            _sheet.Upsert(region.Region.Id, region.Result.Latex, region.Result.Tokens, region.Region.Bounds);
+        }
+
+        RecomputeReport report = _sheet.RecomputeDetailed();
+        HashSet<Guid> dirtySources = regions.Where(region => region.Dirty).Select(region => region.Region.Id).ToHashSet();
+
+        UncertainStrokeIds = uncertain;
         ProvenanceStrokeIds = NoStrokes;
 
-        if (string.IsNullOrEmpty(result.Latex))
+        UpdateAnswers(report, mode);
+        UpdateRipple(report, dirtySources, mode);
+        RecognitionText = BuildRecognitionText(regions, accepted);
+
+        // Only after every graph/UI mutation has succeeded does this pass become next-pass cache authority.
+        // Glyph banking below is a passive side effect, not part of recognition/Sheet correctness.
+        _previousRegions = regions.ToArray();
+        if (mode != RecognitionMode.Load)
         {
-            RecognitionText = "(couldn't read that — try clearer symbols)";
-            UncertainStrokeIds = NoStrokes;
-            return;
+            BankNewCompletedQueries(regions, strokeSnapshot);
+        }
+    }
+
+    private void UpdateAnswers(RecomputeReport report, RecognitionMode mode)
+    {
+        Dictionary<Guid, AnswerAnimation> current = AnswerLayer.Answers.ToDictionary(answer => answer.OwnerId);
+        HashSet<Guid> changed = report.ChangedResultNodes.Select(node => node.Id).ToHashSet();
+        HashSet<Guid> valid = _sheet.Nodes
+            .Where(IsAnswerableQuery)
+            .Select(node => node.Id)
+            .ToHashSet();
+
+        foreach (Guid stale in current.Keys.Where(id => !valid.Contains(id)).ToArray())
+        {
+            current.Remove(stale);
         }
 
-        // 3.9c: refuse to compute on a shaky read, naming the ambiguous symbol rather than guessing.
-        // 4.5c: and give the refusal a body — the offending strokes themselves glitch on the canvas.
-        RecognitionGate.GateResult gate = RecognitionGate.Evaluate(result, _calibration.MinConfidence);
-        if (!gate.Accepted)
+        foreach (SheetNode node in _sheet.Nodes.Where(IsAnswerableQuery))
         {
-            RecognitionText = gate.Refusal!;
-            UncertainStrokeIds = RecognitionGate.UncertainStrokeIds(result, _calibration.MinConfidence);
-            return;
-        }
-
-        UncertainStrokeIds = NoStrokes;
-        string expression = result.Latex;
-
-        // A trailing '=' is the "compute me" trigger; otherwise just echo what was read.
-        if (_evaluator is not null && expression.EndsWith('='))
-        {
-            EvaluationResult answer = _evaluator.Evaluate(new EvaluationRequest(expression, NoVariables));
-
-            // The typeset text is the honest, always-present readout; the animation SUPPLEMENTS it.
-            RecognitionText = answer.IsComputed
-                ? $"{expression}  {answer.DisplayText}"
-                : $"read:  {expression}      (couldn't compute: {answer.DisplayText})";
-
-            if (answer.IsComputed)
+            bool rebuild = mode == RecognitionMode.Manual || mode == RecognitionMode.Load
+                || changed.Contains(node.Id) || !current.ContainsKey(node.Id);
+            if (!rebuild)
             {
-                // 4.5b: bank only here — a computed '='-read means the expression was FINISHED, so no
-                // partial glyph (the first bar of a live-written '=' reads as a confident '-') can ever
-                // enter the corpus. The dedup set stops re-reads from banking the same ink twice.
-                if (_glyphBank is not null)
-                {
-                    foreach (GlyphSample sample in GlyphCapture.Collect(
-                        result.Tokens, snapshot, _calibration.BankConfidence, DateTimeOffset.UtcNow, _bankedStrokeSets))
-                    {
-                        _glyphBank.Capture(sample);
-                    }
-                }
-
-                AnimateAnswer(answer.DisplayText, result, manual);
+                continue; // same-result recompute keeps the existing answer and does not replay it
             }
 
-            return;
+            AnswerAnimation? replacement = TryBuildAnimation(
+                node.Id,
+                node.Result!.DisplayText,
+                node.Tokens,
+                play: mode != RecognitionMode.Load);
+            if (replacement is null)
+            {
+                // A changed query must not retain a stale visual merely because synthesis now fails.
+                current.Remove(node.Id);
+            }
+            else
+            {
+                current[node.Id] = replacement;
+            }
         }
 
-        RecognitionText = $"read:  {expression}      ({result.Confidence:P0} confident)";
+        AnswerLayer = new AnswerLayer(current.Values.OrderBy(answer => answer.Sequence).ToArray());
     }
 
-    /// <summary>
-    /// Plays the answer unless this is a live re-read of exactly what's already showing — the page
-    /// re-reads on every pen-lift, and replaying an unchanged answer each time is noise. The manual
-    /// button always replays (the user asked).
-    /// </summary>
-    private void AnimateAnswer(string answerText, RecognitionResult result, bool manual)
+    private static bool IsAnswerableQuery(SheetNode node) =>
+        node.Role == NodeRole.Query && !node.IsConflict && node.Result is { IsComputed: true };
+
+    private void UpdateRipple(RecomputeReport report, IReadOnlySet<Guid> dirtySources, RecognitionMode mode)
     {
-        (string Latex, string Answer) key = (result.Latex, answerText);
-        if (!manual && AnswerAnimation is not null && _lastAnimated == key)
+        if (mode != RecognitionMode.Live)
+        {
+            CausalityRipple = null;
+            return;
+        }
+
+        CausalityRippleStep[] steps = report.CausallyAffectedNodes
+            .Where(node => !dirtySources.Contains(node.Id))
+            .Select(node => new CausalityRippleStep(
+                node.Id,
+                node.Tokens.SelectMany(token => token.SourceStrokeIds).Distinct().ToArray()))
+            .Where(step => step.StrokeIds.Count > 0)
+            .ToArray();
+        CausalityRipple = steps.Length == 0 ? null : new CausalityRipple(steps, ++_visualSequence);
+    }
+
+    private void BankNewCompletedQueries(
+        IReadOnlyList<RegionRecognition> regions,
+        IReadOnlyList<Stroke> strokes)
+    {
+        if (_glyphBank is null)
         {
             return;
         }
 
-        if (TryBuildAnimation(answerText, result.Tokens) is { } animation)
+        foreach (RegionRecognition region in regions.Where(region => region.Dirty))
         {
-            AnswerAnimation = animation;
-            _lastAnimated = key;
-            _lastAnsweredTokens = result.Tokens;
+            SheetNode? node = _sheet.Find(region.Region.Id);
+            if (node is null || !IsAnswerableQuery(node))
+            {
+                continue;
+            }
+
+            foreach (GlyphSample sample in GlyphCapture.Collect(
+                region.Result.Tokens,
+                strokes,
+                _calibration.BankConfidence,
+                DateTimeOffset.UtcNow,
+                _bankedStrokeSets))
+            {
+                _glyphBank.Capture(sample);
+            }
         }
     }
 
-    /// <summary>
-    /// Best-effort: build the animated answer spawning from the '=' sign. Silently yields null (leaving the
-    /// typeset text as the sole readout) when there's no synthesizer, no '=' anchor, or any output symbol the
-    /// sources can't supply — an honest fallback until the 4e font source guarantees full coverage.
-    /// </summary>
-    private AnswerAnimation? TryBuildAnimation(string answerText, IReadOnlyList<RecognizedToken> tokens)
+    private string BuildRecognitionText(
+        IReadOnlyList<RegionRecognition> regions,
+        IReadOnlyDictionary<Guid, RegionRecognition> accepted)
+    {
+        if (regions.Count == 0)
+        {
+            return IdleHint;
+        }
+
+        var lines = new List<string>(regions.Count);
+        foreach (RegionRecognition region in regions.OrderBy(region => region.Region.Bounds.Y))
+        {
+            if (!accepted.ContainsKey(region.Region.Id))
+            {
+                RecognitionGate.GateResult gate = RecognitionGate.Evaluate(region.Result, _calibration.MinConfidence);
+                lines.Add(string.IsNullOrWhiteSpace(region.Result.Latex)
+                    ? "(couldn't read that — try clearer symbols)"
+                    : gate.Refusal ?? "(couldn't read that — try clearer symbols)");
+                continue;
+            }
+
+            SheetNode? node = _sheet.Find(region.Region.Id);
+            lines.Add(node is { Role: NodeRole.Query, Result: { } result }
+                ? result.IsComputed
+                    ? $"{node.Latex}  {result.DisplayText}"
+                    : $"{node.Latex}  (couldn't compute: {result.DisplayText})"
+                : $"read:  {region.Result.Latex}  ({region.Result.Confidence:P0} confident)");
+        }
+
+        return string.Join("    ·    ", lines);
+    }
+
+    private AnswerAnimation? TryBuildAnimation(
+        Guid ownerId,
+        string answerText,
+        IReadOnlyList<RecognizedToken> tokens,
+        bool play)
     {
         (InkBounds Anchor, double LineHeight)? spawn = FindSpawn(tokens);
         if (_synthesizer is null || spawn is null)
@@ -290,148 +359,237 @@ public partial class MainWindowViewModel : ViewModelBase, IDisposable
             return null;
         }
 
-        (InkBounds anchor, double lineHeight) = spawn.Value;
-        var options = new SynthesisOptions { LineHeight = lineHeight };
-
-        // Draw the handwriting form, not the raw CAS surface: "4 * y" must be written "4y" (juxtaposition),
-        // never traced literally with a scribbly '*'. The typeset RecognitionText keeps the raw DisplayText.
         string handwriting = HandwritingText.FromDisplayText(answerText);
-
-        // Unseeded in the app so repeated identical answers get fresh jitter; tests inject a seeded Random.
-        SynthesizedHandwriting? synthesized = _synthesizer.Synthesize(handwriting, anchor, options, new Random());
-        if (synthesized is null || synthesized.MissingSymbols.Count > 0)
-        {
-            return null;
-        }
-
-        return new AnswerAnimation(synthesized, ++_animationSequence);
+        SynthesizedHandwriting? synthesized = _synthesizer.Synthesize(
+            handwriting,
+            spawn.Value.Anchor,
+            new SynthesisOptions { LineHeight = spawn.Value.LineHeight },
+            new Random());
+        return synthesized is null || synthesized.MissingSymbols.Count > 0
+            ? null
+            : new AnswerAnimation(ownerId, synthesized, ++_visualSequence, play);
     }
 
-    /// <summary>
-    /// Picks the animation spawn: the LAST '=' token's bounds is the anchor, and the line height is the median
-    /// height of the non-'=' tokens (the '=' itself is short, so it's excluded), clamped to a sane pen range.
-    /// Pure and static so it's testable headlessly. Null when there's no '=' to spawn from.
-    /// </summary>
     internal static (InkBounds Anchor, double LineHeight)? FindSpawn(IReadOnlyList<RecognizedToken> tokens)
     {
         int equalsIndex = -1;
         for (int i = 0; i < tokens.Count; i++)
         {
-            if (tokens[i].Latex == "=")
-            {
-                equalsIndex = i;
-            }
+            if (tokens[i].Latex == "=") equalsIndex = i;
         }
 
-        if (equalsIndex < 0)
-        {
-            return null;
-        }
-
-        var heights = new List<double>(tokens.Count);
-        for (int i = 0; i < tokens.Count; i++)
-        {
-            if (tokens[i].Latex != "=")
-            {
-                heights.Add(tokens[i].Bounds.Height);
-            }
-        }
-
-        double lineHeight = Math.Clamp(Median(heights, fallback: 48.0), 24.0, 96.0);
-        return (tokens[equalsIndex].Bounds, lineHeight);
+        if (equalsIndex < 0) return null;
+        double[] heights = tokens.Where(token => token.Latex != "=").Select(token => token.Bounds.Height).Order().ToArray();
+        double median = heights.Length == 0
+            ? 48
+            : heights.Length % 2 == 1 ? heights[heights.Length / 2] : (heights[heights.Length / 2 - 1] + heights[heights.Length / 2]) / 2;
+        return (tokens[equalsIndex].Bounds, Math.Clamp(median, 24, 96));
     }
 
-    /// <summary>Median of the values, or <paramref name="fallback"/> when the list is empty.</summary>
-    private static double Median(List<double> values, double fallback)
+    /// <summary>Builds schema v3 from raw ink plus neutral cache snapshots; no graph edges are serialized.</summary>
+    public PenumbraDocument CreateDocumentSnapshot()
     {
-        if (values.Count == 0)
+        PersistedRegion[] regions = _previousRegions.Select(region =>
         {
-            return fallback;
+            SheetNode? node = _sheet.Find(region.Region.Id);
+            PersistedNodeResult? result = node?.Result is null ? null : new PersistedNodeResult(
+                node.Result.Latex,
+                node.Result.DisplayText,
+                node.Result.IsComputed,
+                node.Result.Kind.ToString());
+            return new PersistedRegion(
+                region.Region.Id,
+                region.Region.StrokeIds.ToArray(),
+                region.Region.Bounds,
+                new PersistedRecognition(
+                    region.Result.Latex,
+                    region.Result.Tokens.ToArray(),
+                    region.Result.Confidence,
+                    region.Result.MinConfidence),
+                result);
+        }).ToArray();
+        return Document.ToDocument() with { Version = PenumbraDocumentSerializer.SchemaVersion, Regions = regions };
+    }
+
+    /// <summary>
+    /// Loads raw ink first, then treats valid v3 snapshots only as recognition cache input. Sheet edges,
+    /// roles, conflicts and results are always rebuilt through segmentation + Upsert + recompute; persisted
+    /// results are never authoritative. v1/v2 naturally supply an empty cache and take the same path.
+    /// </summary>
+    public async Task LoadDocumentAsync(PenumbraDocument document)
+    {
+        ArgumentNullException.ThrowIfNull(document);
+        _liveDebouncer.Cancel();
+        CancelRecognition();
+        ++_recognitionGeneration;
+        _suppressDocumentChanged = true;
+        try
+        {
+            Document.Load(document);
+        }
+        finally
+        {
+            _suppressDocumentChanged = false;
         }
 
-        values.Sort();
-        int mid = values.Count / 2;
-        return values.Count % 2 == 1 ? values[mid] : (values[mid - 1] + values[mid]) / 2.0;
+        _bankedStrokeSets.Clear();
+        _previousRegions = BuildValidLoadCache(document);
+        AnswerLayer = AnswerLayer.Empty;
+        CausalityRipple = null;
+        ProvenanceStrokeIds = NoStrokes;
+        await RecognizeCoreAsync(RecognitionMode.Load);
+    }
+
+    private static IReadOnlyList<RegionRecognition> BuildValidLoadCache(PenumbraDocument document)
+    {
+        IReadOnlyList<PersistedRegion> persistedRegions = document.Regions ?? Array.Empty<PersistedRegion>();
+        if (document.Version < 3 || persistedRegions.Count == 0)
+        {
+            return Array.Empty<RegionRecognition>();
+        }
+
+        // Duplicate stroke ids make a reference ambiguous, so invalidate all cached regions rather than
+        // guessing. Raw ink still loads and will be freshly recognized.
+        HashSet<Guid> ids = document.Strokes.Select(stroke => stroke.Id).ToHashSet();
+        if (ids.Count != document.Strokes.Count)
+        {
+            return Array.Empty<RegionRecognition>();
+        }
+
+        Guid[] persistedRegionIds = persistedRegions.Select(region => region.Id).ToArray();
+        Guid[] referencedStrokeIds = persistedRegions.SelectMany(region => region.StrokeIds).ToArray();
+        if (persistedRegionIds.Any(id => id == Guid.Empty)
+            || persistedRegionIds.Distinct().Count() != persistedRegionIds.Length
+            || referencedStrokeIds.Distinct().Count() != referencedStrokeIds.Length)
+        {
+            // Regions form a partition. Duplicate region ids or cross-region stroke ownership make stable
+            // matching ambiguous; discard the cache wholesale and let current segmentation reconstruct it.
+            return Array.Empty<RegionRecognition>();
+        }
+
+        var valid = new List<RegionRecognition>();
+        foreach (PersistedRegion region in persistedRegions)
+        {
+            HashSet<Guid> regionIds = region.StrokeIds.ToHashSet();
+            bool validRegion = regionIds.Count == region.StrokeIds.Count
+                && regionIds.Count > 0
+                && regionIds.All(ids.Contains)
+                && region.Recognition.Tokens.All(token =>
+                    token.SourceStrokeIds.Count > 0 && token.SourceStrokeIds.All(regionIds.Contains));
+            if (!validRegion)
+            {
+                continue;
+            }
+
+            var placeholder = new InkRegion(region.Id, region.StrokeIds.ToArray(), region.Bounds, Array.Empty<StrokeGroup>());
+            var result = new RecognitionResult(
+                region.Recognition.Latex,
+                region.Recognition.Tokens.ToArray(),
+                region.Recognition.Confidence,
+                region.Recognition.MinConfidence);
+            valid.Add(new RegionRecognition(placeholder, result, Dirty: false));
+        }
+
+        return valid;
     }
 
     private bool CanRecognize => Document.Strokes.Count > 0;
 
     [RelayCommand(CanExecute = nameof(CanUndo))]
     private void Undo() => Document.Undo();
-
     private bool CanUndo => Document.CanUndo;
 
     [RelayCommand(CanExecute = nameof(CanRedo))]
     private void Redo() => Document.Redo();
-
     private bool CanRedo => Document.CanRedo;
 
     [RelayCommand(CanExecute = nameof(CanClear))]
-    private void Clear() =>
-        // Emptying the page triggers the full transient reset (answer, glitch, provenance, banked keys)
-        // via OnDocumentChanged — one code path whether the page empties by Clear, undo, or load.
-        Document.Clear();
-
+    private void Clear() => Document.Clear();
     private bool CanClear => Document.Strokes.Count > 0;
 
     partial void OnLiveRecognitionChanged(bool value)
     {
-        if (value)
-        {
-            // Turning live on with ink already on the page: read it after one quiet period.
-            if (Document.Strokes.Count > 0)
-            {
-                _liveDebouncer.Signal();
-            }
-        }
-        else
-        {
-            _liveDebouncer.Cancel();
-        }
+        if (!value) _liveDebouncer.Cancel();
+        else if (Document.Strokes.Count > 0) _liveDebouncer.Signal();
     }
 
     private void OnDocumentChanged()
     {
+        int previousStrokeCount = _lastKnownStrokeCount;
+        _lastKnownStrokeCount = Document.Strokes.Count;
+
         UndoCommand.NotifyCanExecuteChanged();
         RedoCommand.NotifyCanExecuteChanged();
         ClearCommand.NotifyCanExecuteChanged();
         RecognizeCommand.NotifyCanExecuteChanged();
+        if (_suppressDocumentChanged) return;
 
-        // Whatever the highlight pointed at, the page just changed under it.
+        // Undo/redo, clear, load-adjacent hosts, and programmatic InkDocument edits do not pass through
+        // NotifyStrokeStarted. They still invalidate an in-flight snapshot immediately: allowing that
+        // stale pass to apply until the next debounce would briefly restore erased values/answers.
+        CancelRecognition();
+        ++_recognitionGeneration;
         ProvenanceStrokeIds = NoStrokes;
-
         if (Document.Strokes.Count == 0)
         {
             ResetTransientState();
-            return;
         }
-
-        // 4.5b: the pen lifted (or undo/redo/load changed the ink) — read the page after a quiet beat.
-        if (LiveRecognition)
+        else if (LiveRecognition)
         {
-            _liveDebouncer.Signal();
+            _liveDebouncer.Signal(QuietPeriodFor(previousStrokeCount, Document.Strokes.Count));
         }
     }
 
-    /// <summary>The page is empty: nothing to read, answer, glitch, highlight, or remember.</summary>
+    /// <summary>
+    /// The debounce window for a document change: stroke-removing edits (erase, undo of an add) wait
+    /// the longer erase grace because a rewrite usually follows; everything else uses the live period.
+    /// </summary>
+    internal static TimeSpan QuietPeriodFor(int previousStrokeCount, int currentStrokeCount) =>
+        currentStrokeCount < previousStrokeCount ? EraseQuietPeriod : LiveQuietPeriod;
+
     private void ResetTransientState()
     {
         _liveDebouncer.Cancel();
-        _recognitionCts?.Cancel();
-        AnswerAnimation = null;
-        _lastAnimated = null;
-        _lastAnsweredTokens = Array.Empty<RecognizedToken>();
+        CancelRecognition();
+        ++_recognitionGeneration;
+        foreach (Guid id in _sheet.Nodes.Select(node => node.Id).ToArray()) _sheet.Remove(id);
+        _sheet.RecomputeDetailed();
+        _previousRegions = Array.Empty<RegionRecognition>();
+        AnswerLayer = AnswerLayer.Empty;
+        CausalityRipple = null;
         UncertainStrokeIds = NoStrokes;
         ProvenanceStrokeIds = NoStrokes;
         _bankedStrokeSets.Clear();
         RecognitionText = IdleHint;
     }
 
-    public void Dispose()
+    private void CancelRecognition()
     {
-        _liveDebouncer.Dispose();
         _recognitionCts?.Cancel();
         _recognitionCts?.Dispose();
         _recognitionCts = null;
+    }
+
+    public void Dispose()
+    {
+        if (_disposed) return;
+        _disposed = true;
+        _liveDebouncer.Dispose();
+        CancelRecognition();
+    }
+
+    private enum RecognitionMode { Live, Manual, Load }
+
+    private sealed class EmptyRegionRecognizer : IRegionRecognizer
+    {
+        public IReadOnlyList<RegionRecognition> RecognizeRegions(
+            IReadOnlyList<Stroke> strokes,
+            IReadOnlyList<RegionRecognition>? previous = null,
+            CancellationToken cancellationToken = default) => Array.Empty<RegionRecognition>();
+
+        public Task<IReadOnlyList<RegionRecognition>> RecognizeRegionsAsync(
+            IReadOnlyList<Stroke> strokes,
+            IReadOnlyList<RegionRecognition>? previous = null,
+            CancellationToken cancellationToken = default) => Task.FromResult(RecognizeRegions(strokes, previous, cancellationToken));
     }
 }

@@ -11,7 +11,7 @@ namespace Penumbra.Recognition;
 /// M1 grammar is intentionally linear (concatenate ordered tokens). 2-D structure — superscripts,
 /// subscripts, fractions, a <c>\sqrt</c> covering its radicand — is the spatial-grammar follow-up.
 /// </summary>
-public sealed class ExpressionRecognizer : IRecognizer
+public sealed class ExpressionRecognizer : IRecognizer, IRegionRecognizer
 {
     private readonly IStrokeSegmenter _segmenter;
     private readonly IRegionSegmenter _regionSegmenter;
@@ -22,10 +22,10 @@ public sealed class ExpressionRecognizer : IRecognizer
     {
     }
 
-    // Region-aware overload (Phase 5a). The region segmenter clusters the SAME base groups into lines,
-    // so the per-region path and the legacy page path see identical groups; kept injectable so tests can
-    // supply a segmenter and inspect region ids. App DI still resolves the two-arg constructor above
-    // (IRegionSegmenter is not registered) — wiring the multi-region path in is increment 2.
+    // Region-aware overload (Phase 5a). The region segmenter clusters the same base groups into lines,
+    // then re-groups each line's strokes line-locally (see RegionSegmenter), so a region's read depends
+    // only on its own ink; kept injectable so tests can supply a segmenter and inspect region ids. App
+    // DI resolves the two-arg constructor above and registers this type behind IRegionRecognizer too.
     public ExpressionRecognizer(
         IStrokeSegmenter segmenter, IRegionSegmenter regionSegmenter, ISymbolClassifier classifier)
     {
@@ -96,8 +96,8 @@ public sealed class ExpressionRecognizer : IRecognizer
     /// (carrying ids forward from <paramref name="previous"/> so ids stay stable across edits), then
     /// recognizes only the regions whose stroke set changed since they were last read — every clean
     /// region reuses its prior <see cref="RecognitionResult"/> untouched. Pass the returned list back in
-    /// as <paramref name="previous"/> on the next edit. This is the headless core; the App wires it to
-    /// the canvas in increment 2.
+    /// as <paramref name="previous"/> on the next edit. This is the headless core; MainWindowViewModel
+    /// wires it to the canvas (increment 2) and owns the round-trip state.
     /// </summary>
     public IReadOnlyList<RegionRecognition> RecognizeRegions(
         IReadOnlyList<Stroke> strokes,
@@ -105,6 +105,10 @@ public sealed class ExpressionRecognizer : IRecognizer
         CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(strokes);
+
+        // Check before segmentation as well as around each dirty-region model call, so a superseded
+        // UI pass can be abandoned before spending CPU on stale ink.
+        cancellationToken.ThrowIfCancellationRequested();
 
         InkSegmentation? priorSegmentation = previous is null
             ? null
@@ -117,6 +121,10 @@ public sealed class ExpressionRecognizer : IRecognizer
         var results = new List<RegionRecognition>(segmentation.Regions.Count);
         foreach (InkRegion region in segmentation.Regions)
         {
+            // Check clean regions too: cancellation invalidates the whole pass even when all model
+            // results would otherwise be reused from the previous round trip.
+            cancellationToken.ThrowIfCancellationRequested();
+
             // Clean iff the matched prior region covered the exact same strokes: reuse its read verbatim.
             if (priorById.TryGetValue(region.Id, out RegionRecognition? prior)
                 && region.HasSameStrokes(prior.Region))
@@ -125,12 +133,23 @@ public sealed class ExpressionRecognizer : IRecognizer
                 continue;
             }
 
-            cancellationToken.ThrowIfCancellationRequested();
             RecognitionResult result = RecognizeGroups(region.Groups, cancellationToken);
             results.Add(new RegionRecognition(region, result, Dirty: true));
         }
 
         return results;
+    }
+
+    /// <inheritdoc />
+    public Task<IReadOnlyList<RegionRecognition>> RecognizeRegionsAsync(
+        IReadOnlyList<Stroke> strokes,
+        IReadOnlyList<RegionRecognition>? previous = null,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(strokes);
+        return Task.Run(
+            () => RecognizeRegions(strokes, previous, cancellationToken),
+            cancellationToken);
     }
 
     // Classify one line's ordered groups against a single shared context and assemble the tokens into

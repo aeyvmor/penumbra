@@ -29,6 +29,9 @@
                 <Button Content="Undo" Command="{Binding UndoCommand}"/>
                 <Button Content="Redo" Command="{Binding RedoCommand}"/>
                 <Button Content="Clear" Command="{Binding ClearCommand}"/>
+                <ToggleButton Content="Erase"
+                              IsChecked="{Binding IsEraseMode}"
+                              ToolTip.Tip="Erase whole strokes; one drag is one undo step"/>
                 <Border Width="1" Background="#E2E6EC" Margin="4,2"/>
                 <Button Content="Recognize" Command="{Binding RecognizeCommand}" FontWeight="SemiBold"/>
                 <ToggleButton Content="Live"
@@ -37,7 +40,7 @@
                 <Border Width="1" Background="#E2E6EC" Margin="4,2"/>
                 <Button Content="Save" Click="OnSaveClick"/>
                 <Button Content="Open" Click="OnOpenClick"/>
-                <TextBlock Text="Left: draw  ·  Right/Middle: pan  ·  Wheel: zoom  ·  Tap answer: show its source ink"
+                <TextBlock Text="Left: draw/erase  ·  Pen eraser: automatic  ·  Right/Middle: pan  ·  Wheel: zoom  ·  Tap answer: source ink"
                            VerticalAlignment="Center"
                            Margin="10,0,0,0"
                            Foreground="#5C6673"/>
@@ -57,7 +60,9 @@
 
         <controls:InkCanvasControl x:Name="InkCanvas"
                                    Document="{Binding Document}"
-                                   AnswerAnimation="{Binding AnswerAnimation}"
+                                   AnswerLayer="{Binding AnswerLayer}"
+                                   CausalityRipple="{Binding CausalityRipple}"
+                                   IsEraseMode="{Binding IsEraseMode}"
                                    UncertainStrokeIds="{Binding UncertainStrokeIds}"
                                    ProvenanceStrokeIds="{Binding ProvenanceStrokeIds}"/>
     </DockPanel>

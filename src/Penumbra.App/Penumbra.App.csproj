@@ -9,6 +9,7 @@
 
   <ItemGroup>
     <AvaloniaResource Include="Assets\**" />
+    <InternalsVisibleTo Include="Penumbra.App.Tests" />
   </ItemGroup>
 
   <ItemGroup>
@@ -38,5 +39,6 @@
     <ProjectReference Include="..\Penumbra.Cas\Penumbra.Cas.csproj" />
     <ProjectReference Include="..\Penumbra.Recognition\Penumbra.Recognition.csproj" />
     <ProjectReference Include="..\Penumbra.Graphing\Penumbra.Graphing.csproj" />
+    <ProjectReference Include="..\Penumbra.Sheet\Penumbra.Sheet.csproj" />
   </ItemGroup>
 </Project>

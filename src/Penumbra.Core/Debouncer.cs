@@ -1,11 +1,11 @@
 namespace Penumbra.Core;
 
 /// <summary>
-/// Quiet-period debouncer (Phase 4.5b): <see cref="Signal"/> on every event; the callback fires once
+/// Quiet-period debouncer (Phase 4.5b): <see cref="Signal()"/> on every event; the callback fires once
 /// after a full quiet period with no further signals. Built on <see cref="TimeProvider"/> so tests
 /// drive it with fake time instead of sleeps. The callback runs on a timer thread — callers marshal
 /// to their UI thread themselves. Thread-safe; a fire that loses the race to a concurrent
-/// <see cref="Signal"/>/<see cref="Cancel"/> is suppressed by generation check.
+/// <see cref="Signal()"/>/<see cref="Cancel"/> is suppressed by generation check.
 /// </summary>
 public sealed class Debouncer : IDisposable
 {
@@ -31,9 +31,22 @@ public sealed class Debouncer : IDisposable
         _time = time ?? TimeProvider.System;
     }
 
-    /// <summary>An event happened: (re)start the quiet period.</summary>
-    public void Signal()
+    /// <summary>An event happened: (re)start the default quiet period.</summary>
+    public void Signal() => Signal(_quietPeriod);
+
+    /// <summary>
+    /// An event happened: (re)start the quiet period with a one-off duration. The override applies to
+    /// this restart only — the next plain <see cref="Signal()"/> is back on the constructor default. Lets
+    /// a caller stretch the quiet window after events that predict an immediate follow-up (an erase is
+    /// usually followed by a rewrite) without two debouncers racing each other.
+    /// </summary>
+    public void Signal(TimeSpan quietPeriod)
     {
+        if (quietPeriod <= TimeSpan.Zero)
+        {
+            throw new ArgumentOutOfRangeException(nameof(quietPeriod), quietPeriod, "quiet period must be positive");
+        }
+
         lock (_gate)
         {
             if (_disposed)
@@ -43,7 +56,7 @@ public sealed class Debouncer : IDisposable
 
             _timer?.Dispose();
             long generation = ++_generation;
-            _timer = _time.CreateTimer(_ => OnDue(generation), null, _quietPeriod, Timeout.InfiniteTimeSpan);
+            _timer = _time.CreateTimer(_ => OnDue(generation), null, quietPeriod, Timeout.InfiniteTimeSpan);
         }
     }
 

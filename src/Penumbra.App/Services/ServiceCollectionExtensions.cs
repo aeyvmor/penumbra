@@ -5,6 +5,7 @@ using Penumbra.Core;
 using Penumbra.Graphing;
 using Penumbra.Ink;
 using Penumbra.Recognition;
+using Penumbra.Sheet;
 
 namespace Penumbra.App.Services;
 
@@ -16,8 +17,16 @@ public static class ServiceCollectionExtensions
     {
         services.AddSingleton<IStrokeSegmenter, OverlapStrokeSegmenter>();
         services.AddSingleton<ISymbolClassifier, OnnxSymbolClassifier>();
-        services.AddSingleton<IRecognizer, ExpressionRecognizer>();
+        // One recognizer owns both the legacy and region-aware seams. Registering the concrete once is
+        // important: two instances could carry different model/calibration state and make manual and live
+        // reads disagree even though they appear to use the same implementation.
+        services.AddSingleton<ExpressionRecognizer>();
+        services.AddSingleton<IRecognizer>(sp => sp.GetRequiredService<ExpressionRecognizer>());
+        services.AddSingleton<IRegionRecognizer>(sp => sp.GetRequiredService<ExpressionRecognizer>());
         services.AddSingleton<IEvaluator, AngouriMathEvaluator>();
+        services.AddSingleton<IExpressionAnalyzer, AngouriMathExpressionAnalyzer>();
+        // A graph is page/VM state, never an application singleton. Every window receives an isolated sheet.
+        services.AddTransient<SheetGraph>();
         services.AddSingleton<IGraphDetector, NoOpGraphDetector>();
 
         // B4: the decision contract (reject/bank bars, temperature + energy applied in-classifier) rides

@@ -18,7 +18,7 @@ public partial class MainWindow : Window
 
         // 4.5b/4.5d: the canvas reports gestures; the view-model owns what they mean.
         InkCanvas.DrawingStarted += (_, _) => ViewModel?.NotifyStrokeStarted();
-        InkCanvas.AnswerTapped += (_, _) => ViewModel?.ToggleAnswerProvenance();
+        InkCanvas.AnswerTapped += (_, e) => ViewModel?.ToggleAnswerProvenance(e.OwnerId);
 
         // The view-model holds a live-recognition timer; closing the window must stop it.
         Closed += (_, _) => (DataContext as IDisposable)?.Dispose();
@@ -84,7 +84,7 @@ public partial class MainWindow : Window
             return;
         }
 
-        string json = PenumbraDocumentSerializer.Serialize(vm.Document.ToDocument());
+        string json = PenumbraDocumentSerializer.Serialize(vm.CreateDocumentSnapshot());
         await using Stream stream = await file.OpenWriteAsync();
         await using var writer = new StreamWriter(stream);
         await writer.WriteAsync(json);
@@ -112,6 +112,6 @@ public partial class MainWindow : Window
         await using Stream stream = await files[0].OpenReadAsync();
         using var reader = new StreamReader(stream);
         string json = await reader.ReadToEndAsync();
-        vm.Document.Load(PenumbraDocumentSerializer.Deserialize(json));
+        await vm.LoadDocumentAsync(PenumbraDocumentSerializer.Deserialize(json));
     }
 }

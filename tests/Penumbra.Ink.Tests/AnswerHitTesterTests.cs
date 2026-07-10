@@ -54,6 +54,14 @@ public sealed class AnswerHitTesterTests
         Assert.False(AnswerHitTester.HitTest(Array.Empty<Stroke>(), 0, 0, tolerance: 100));
     }
 
+    [Fact]
+    public void NaNTolerancePreservesEstablishedMissBehavior()
+    {
+        var stroke = HLine(y: 50, x0: 10, x1: 60);
+
+        Assert.False(AnswerHitTester.HitTest(new[] { stroke }, 30, 50, tolerance: double.NaN));
+    }
+
     private static Stroke HLine(double y, double x0, double x1) => new(
         Guid.NewGuid(),
         Enumerable.Range(0, 11).Select(i => new StrokeSample(x0 + (x1 - x0) * i / 10.0, y, TimeSpan.Zero, 0.5)).ToList());

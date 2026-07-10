@@ -5,16 +5,17 @@ namespace Penumbra.Recognition;
 /// <see cref="ExpressionRecognizer"/> so both the single-line guard (which then recognizes the largest
 /// line) and <see cref="RegionSegmenter"/> (which recognizes every line) share one implementation.
 /// Line clustering is exactly y-interval overlap with a tolerance: two boxes join a line when the
-/// vertical gap between them falls within ~0.8x the page's median symbol height. Keeping it in one
+/// vertical gap between them falls within ~0.7x the page's median symbol height. Keeping it in one
 /// place means Phase 5's multi-line regions can never drift from the guard they generalize.
 /// </summary>
 internal static class LineClustering
 {
     // Order boxes by vertical center, then cut a new line wherever the vertical gap down to the
-    // current line's lower edge exceeds ~0.8x the page's median symbol height. The page median is a
-    // stable scale (robust to one stray mark); 0.8x sits comfortably above intra-line baseline jitter
-    // yet below normal line spacing. Lines come back top-to-bottom; groups within a line keep the
-    // center-sorted order (callers reorder left-to-right for reading/assembly).
+    // current line's lower edge exceeds ~0.7x the page's median symbol height. The page median is a
+    // stable scale (robust to one stray mark); 0.7x sits above intra-line baseline jitter yet below
+    // normal line spacing (retuned down from 0.8 after s19 dogfood, where two expressions written
+    // nearly touching — gap ≈ 0.75x — fused into one garbled region). Lines come back top-to-bottom;
+    // groups within a line keep the center-sorted order (callers reorder left-to-right for assembly).
     public static List<List<StrokeGroup>> IntoLines(IReadOnlyList<StrokeGroup> groups)
     {
         if (groups.Count == 0)
@@ -24,7 +25,7 @@ internal static class LineClustering
 
         double[] heights = groups.Select(g => g.Bounds.Height).OrderBy(h => h).ToArray();
         double medianHeight = heights[heights.Length / 2];
-        double threshold = 0.8 * (medianHeight > 0 ? medianHeight : 1.0);
+        double threshold = 0.7 * (medianHeight > 0 ? medianHeight : 1.0);
 
         var lines = new List<List<StrokeGroup>>();
         var current = new List<StrokeGroup>();

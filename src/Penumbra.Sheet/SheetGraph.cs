@@ -121,7 +121,18 @@ public sealed class SheetGraph
     /// definition's value downstream as <see cref="EvaluationRequest.Variables"/>. Returns the nodes
     /// whose <see cref="SheetNode.Result"/> changed.
     /// </summary>
-    public IReadOnlyList<SheetNode> Recompute()
+    public IReadOnlyList<SheetNode> Recompute() => RecomputeDetailed().ChangedResultNodes;
+
+    /// <summary>
+    /// Recomputes the expanded dirty set and reports both value changes and causal participation.
+    /// </summary>
+    /// <remarks>
+    /// <see cref="RecomputeReport.ChangedResultNodes"/> preserves <see cref="Recompute"/>'s historical
+    /// value-equality contract. <see cref="RecomputeReport.CausallyAffectedNodes"/> is broader: it also
+    /// contains nodes which were recomputed but produced an equal result. Its deterministic order is
+    /// the actual evaluation order, suitable for a causality ripple without replaying unchanged answers.
+    /// </remarks>
+    public RecomputeReport RecomputeDetailed()
     {
         var nodes = _nodes.Values.ToList();
 
@@ -132,12 +143,14 @@ public sealed class SheetGraph
         var dirty = ExpandDirty(nodes);
 
         var changed = new List<SheetNode>();
+        var affected = new List<SheetNode>(dirty.Count);
 
         // Cycle members error out first (no evaluation, no partial results — kickoff decision 4).
-        foreach (var node in nodes)
+        foreach (var node in nodes.OrderBy(n => n.InsertionIndex))
         {
             if (cycleIds.Contains(node.Id) && dirty.Contains(node.Id))
             {
+                affected.Add(node);
                 Apply(node, CycleError, changed);
             }
         }
@@ -150,6 +163,7 @@ public sealed class SheetGraph
                 continue;
             }
 
+            affected.Add(node);
             var result = node.IsConflict
                 ? ConflictError(node.DefinedSymbol)
                 : Evaluate(node, symbolOwner);
@@ -161,7 +175,7 @@ public sealed class SheetGraph
             node.Dirty = false;
         }
 
-        return changed;
+        return new RecomputeReport(changed, affected);
     }
 
     private static void Apply(SheetNode node, EvaluationResult result, List<SheetNode> changed)

@@ -210,6 +210,80 @@ public sealed class RegionSegmenterTests
         Assert.Equal(topId, only.Id);                      // 3-stroke donor out-bids the 2-stroke one
     }
 
+    // ---- line-local symbol grouping (s19 dogfood regression) ---------------------------------------
+
+    [Fact]
+    public void LineGrouping_IsIndependentOfInkOnOtherLines()
+    {
+        // The s19 dogfood bug: OverlapStrokeSegmenter scales its merge gaps by the PAGE median stroke
+        // size, so writing small ink on another line used to shrink the gaps and split this line's
+        // '='-style bar pair into two minus signs on the next fresh read (the region cache hid it until
+        // an erase+undo forced one). A line's grouping must depend on that line's ink alone.
+        var line = EqualsLikeLine(y0: 0);
+        var smallInkElsewhere = Enumerable.Range(0, 6)
+            .Select(i => VStroke(40 * i, 300, 6))
+            .ToList();
+
+        InkSegmentation alone = _segmenter.Segment(line);
+        InkSegmentation withNoise = _segmenter.Segment(line.Concat(smallInkElsewhere).ToList());
+
+        int[] aloneShape = alone.Regions[0].Groups.Select(g => g.Strokes.Count).ToArray();
+        int[] noisyShape = withNoise.Regions[0].Groups.Select(g => g.Strokes.Count).ToArray();
+        Assert.Equal(aloneShape, noisyShape);
+        // And concretely: the two '=' bars stay one two-stroke symbol, not two one-stroke bars.
+        Assert.Contains(2, noisyShape);
+    }
+
+    [Fact]
+    public void EraseUndoShapedRoundTrip_ReadsTheRestoredLineIdentically()
+    {
+        // The exact shape of the dogfood repro: page reads fine → one line is erased (pass runs on the
+        // remainder) → undo restores it → the fresh read of the restored line must group exactly as the
+        // original read did, even though the region id (and thus the cache) did not survive.
+        var line = EqualsLikeLine(y0: 0);
+        var otherLine = Enumerable.Range(0, 6).Select(i => VStroke(40 * i, 300, 6)).ToList();
+        List<Stroke> page = line.Concat(otherLine).ToList();
+
+        InkSegmentation first = _segmenter.Segment(page);
+        InkSegmentation afterErase = _segmenter.Segment(otherLine, first);
+        InkSegmentation afterUndo = _segmenter.Segment(page, afterErase);
+
+        int[] firstShape = first.Regions[0].Groups.Select(g => g.Strokes.Count).ToArray();
+        int[] undoShape = afterUndo.Regions[0].Groups.Select(g => g.Strokes.Count).ToArray();
+        Assert.Equal(firstShape, undoShape);
+    }
+
+    [Fact]
+    public void NearTouchingLines_SplitIntoSeparateRegions()
+    {
+        // s19 dogfood: two expressions written with their line gap at ~0.75x the median symbol height
+        // used to fuse into one garbled region ('3-2=' + '2+7=' → "3+-72=="). The split threshold is
+        // now 0.7x, so this gap separates; genuinely interleaved ink (gap ≤ 0.7x) still fuses.
+        var line1 = new[] { VStroke(0, 0, 20), VStroke(40, 0, 20) };
+        var line2 = new[] { VStroke(0, 35, 20), VStroke(40, 35, 20) };   // gap 15 = 0.75 × height 20
+
+        InkSegmentation seg = _segmenter.Segment(line1.Concat(line2).ToList());
+
+        Assert.Equal(2, seg.Regions.Count);
+    }
+
+    // An 'x = 9'-shaped line: two tall symbols flanking a two-bar '=' whose bars sit 10px apart —
+    // together on their own line the bars merge (median size 30 → vertical gap window 18), and they
+    // must KEEP merging no matter what the rest of the page looks like.
+    private static List<Stroke> EqualsLikeLine(double y0) => new()
+    {
+        VStroke(0, y0, 30),           // tall symbol ('x')
+        HBar(40, y0 + 10, 30),        // upper '=' bar
+        HBar(40, y0 + 20, 30),        // lower '=' bar
+        VStroke(90, y0, 30),          // tall symbol ('9')
+    };
+
+    // A horizontal bar starting at (x0, y) of the given width; height ~0, like a drawn '=' bar.
+    private static Stroke HBar(double x0, double y, double width) =>
+        new(Guid.NewGuid(), Enumerable.Range(0, 11)
+            .Select(i => new StrokeSample(x0 + width * i / 10.0, y, TimeSpan.Zero, 0.5))
+            .ToList());
+
     // A vertical stroke at column x spanning [y0, y0+height]; only its box drives the segmenter.
     private static Stroke VStroke(double x, double y0, double height) =>
         new(Guid.NewGuid(), Enumerable.Range(0, 11)

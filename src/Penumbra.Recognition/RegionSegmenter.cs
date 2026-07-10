@@ -38,14 +38,30 @@ public sealed class RegionSegmenter : IRegionSegmenter
             return new InkSegmentation(Array.Empty<InkRegion>());
         }
 
+        // The page-wide pass only decides which strokes share a line. Symbol grouping inside each line
+        // is then REDONE over that line's strokes alone, because the segmenter scales its merge gaps by
+        // the median stroke size of whatever it is given: fed the whole page, small ink on one line
+        // shrinks the gaps for every other line, so a fresh read of an untouched '=' could split into
+        // two minus signs the moment unrelated ink appeared elsewhere (s19 dogfood). Line-local
+        // regrouping makes a line's read a function of that line's ink only. For a single-line page the
+        // rerun sees the identical stroke set, so this path still matches the pre-5a page path exactly.
+        Dictionary<Stroke, int> documentOrder = new(ReferenceEqualityComparer.Instance);
+        for (int i = 0; i < strokes.Count; i++)
+        {
+            documentOrder.TryAdd(strokes[i], i);
+        }
+
         // Each clustered line becomes a region; groups within it are ordered left-to-right (X, then Y),
-        // matching the reading order ExpressionRecognizer assembles in, so a single-line page yields the
-        // exact groups+order the pre-5a page path fed the classifier.
+        // matching the reading order ExpressionRecognizer assembles in.
         List<(IReadOnlyList<StrokeGroup> Groups, IReadOnlyList<Guid> StrokeIds, InkBounds Bounds)> lines =
             LineClustering.IntoLines(groups)
                 .Select(line =>
                 {
-                    List<StrokeGroup> ordered = line
+                    List<Stroke> lineStrokes = line
+                        .SelectMany(g => g.Strokes)
+                        .OrderBy(s => documentOrder[s])   // line-local pass sees document draw order
+                        .ToList();
+                    List<StrokeGroup> ordered = _segmenter.Segment(lineStrokes)
                         .OrderBy(g => g.Bounds.X)
                         .ThenBy(g => g.Bounds.Y)
                         .ToList();

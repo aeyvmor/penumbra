@@ -123,6 +123,63 @@ public sealed class DebouncerTests
             () => new Debouncer(TimeSpan.Zero, () => { }, new FakeTimeProvider()));
     }
 
+    // ---- one-off quiet-period override (s19 erase grace) --------------------------------------------
+
+    [Fact]
+    public void SignalWithOverride_WaitsThatLong_NotTheDefault()
+    {
+        var time = new FakeTimeProvider();
+        int fired = 0;
+        using var debouncer = new Debouncer(Quiet, () => fired++, time);
+
+        debouncer.Signal(TimeSpan.FromMilliseconds(2200));
+        time.Advance(TimeSpan.FromMilliseconds(2199));
+        Assert.Equal(0, fired);   // the default 600ms did NOT apply
+
+        time.Advance(TimeSpan.FromMilliseconds(1));
+        Assert.Equal(1, fired);
+    }
+
+    [Fact]
+    public void OverrideIsOneOff_NextPlainSignalUsesTheDefaultAgain()
+    {
+        var time = new FakeTimeProvider();
+        int fired = 0;
+        using var debouncer = new Debouncer(Quiet, () => fired++, time);
+
+        debouncer.Signal(TimeSpan.FromMilliseconds(2200));
+        time.Advance(TimeSpan.FromMilliseconds(2200));
+        Assert.Equal(1, fired);
+
+        debouncer.Signal();
+        time.Advance(Quiet);
+        Assert.Equal(2, fired);
+    }
+
+    [Fact]
+    public void PlainSignal_SupersedesAPendingLongOverride()
+    {
+        // Erase (long grace) followed by a rewrite (plain signal): the rewrite's shorter beat owns the
+        // timer — the user should not keep waiting out the erase grace after they already rewrote.
+        var time = new FakeTimeProvider();
+        int fired = 0;
+        using var debouncer = new Debouncer(Quiet, () => fired++, time);
+
+        debouncer.Signal(TimeSpan.FromMilliseconds(2200));
+        time.Advance(TimeSpan.FromMilliseconds(300));
+        debouncer.Signal();
+
+        time.Advance(Quiet);
+        Assert.Equal(1, fired);
+    }
+
+    [Fact]
+    public void SignalWithNonPositiveOverride_IsRejected()
+    {
+        using var debouncer = new Debouncer(Quiet, () => { }, new FakeTimeProvider());
+        Assert.Throws<ArgumentOutOfRangeException>(() => debouncer.Signal(TimeSpan.Zero));
+    }
+
     /// <summary>
     /// Minimal controllable clock: timers fire in due order when <see cref="Advance"/> walks past
     /// them. Enough surface for the debouncer (one-shot timers, dispose); not a general fake.
