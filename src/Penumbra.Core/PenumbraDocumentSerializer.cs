@@ -34,7 +34,6 @@ public static class PenumbraDocumentSerializer
     /// <summary>An empty page stamped with the current schema version.</summary>
     public static PenumbraDocument CreateEmpty() => new(
         Array.Empty<Stroke>(),
-        Array.Empty<ExpressionNode>(),
         new Dictionary<string, string>(),
         SchemaVersion);
 

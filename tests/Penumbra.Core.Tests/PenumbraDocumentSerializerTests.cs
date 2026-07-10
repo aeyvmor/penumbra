@@ -17,7 +17,6 @@ public sealed class PenumbraDocumentSerializerTests
                 new StrokeSample(10, 10, TimeSpan.FromMilliseconds(40), 0.5),
             }),
         },
-        Expressions: Array.Empty<ExpressionNode>(),
         Variables: new Dictionary<string, string> { ["x"] = "5" },
         Version: PenumbraDocumentSerializer.SchemaVersion);
 
@@ -104,7 +103,7 @@ public sealed class PenumbraDocumentSerializerTests
             new StrokeSample(0, 0, TimeSpan.FromSeconds(2), 0),
         });
         var original = new PenumbraDocument(
-            new[] { stroke }, Array.Empty<ExpressionNode>(),
+            new[] { stroke },
             new Dictionary<string, string>(), PenumbraDocumentSerializer.SchemaVersion);
 
         PenumbraDocument result = PenumbraDocumentSerializer.Deserialize(
@@ -123,6 +122,8 @@ public sealed class PenumbraDocumentSerializerTests
     public void LoadsVersion1Json()
     {
         // A pre-3.9e v1 file (strokes were stored smoothed). It must still load, keeping Version = 1.
+        // "Expressions" is kept in the fixture on purpose: the placeholder ExpressionNode was removed
+        // in Phase 5, so old files carry a property the model no longer has — it must be ignored.
         const string v1Json = """
         {
           "Strokes": [

@@ -19,7 +19,7 @@ public sealed class InkDocument
     public bool CanUndo => _undo.Count > 0;
     public bool CanRedo => _redo.Count > 0;
 
-    /// <summary>Raised after any mutation (add, clear, undo, redo, load) so the view can repaint.</summary>
+    /// <summary>Raised after any mutation (add, erase, clear, undo, redo, load) so the view can repaint.</summary>
     public event EventHandler? Changed;
 
     /// <summary>Appends a finished stroke and records it as an undoable edit.</summary>
@@ -38,6 +38,43 @@ public sealed class InkDocument
         }
 
         Apply(new ClearEdit(_strokes.ToList()));
+    }
+
+    /// <summary>
+    /// Removes the stroke with the given id as a single undoable edit; undo restores it at its original
+    /// position in draw order. Erasing an id that isn't present is a harmless no-op that records no history.
+    /// </summary>
+    public void EraseStroke(Guid id)
+        => EraseStrokes(new[] { id });
+
+    /// <summary>
+    /// Removes every stroke whose id is in <paramref name="ids"/> as a single undoable edit — the whole
+    /// batch undoes/redoes as one step (a scratch-out gesture that clears several strokes at once). Ids not
+    /// present are skipped; if none match this is a harmless no-op that records no history. Undo restores
+    /// each stroke at its original position in draw order.
+    /// </summary>
+    public void EraseStrokes(IEnumerable<Guid> ids)
+    {
+        ArgumentNullException.ThrowIfNull(ids);
+
+        // Resolve ids against the current order up front, before any removal shifts indices. Deduping via a
+        // set keeps a repeated id from capturing (and later re-inserting) the same stroke twice.
+        HashSet<Guid> requested = ids.ToHashSet();
+        var removals = new List<(int Index, Stroke Stroke)>();
+        for (int index = 0; index < _strokes.Count; index++)
+        {
+            if (requested.Contains(_strokes[index].Id))
+            {
+                removals.Add((index, _strokes[index]));
+            }
+        }
+
+        if (removals.Count == 0)
+        {
+            return;
+        }
+
+        Apply(new EraseStrokesEdit(removals));
     }
 
     /// <summary>Reverts the most recent edit, if any.</summary>
@@ -118,5 +155,33 @@ public sealed class InkDocument
         public void Apply(List<Stroke> strokes) => strokes.Clear();
 
         public void Revert(List<Stroke> strokes) => strokes.AddRange(_removed);
+    }
+
+    private sealed class EraseStrokesEdit : IInkEdit
+    {
+        // Each removed stroke paired with the index it held before removal, ordered by ascending index so
+        // Revert can re-insert them low-to-high — restoring every stroke to its original slot in draw order.
+        private readonly IReadOnlyList<(int Index, Stroke Stroke)> _removed;
+
+        public EraseStrokesEdit(IEnumerable<(int Index, Stroke Stroke)> removed) =>
+            _removed = removed.OrderBy(r => r.Index).ToList();
+
+        public void Apply(List<Stroke> strokes)
+        {
+            foreach ((_, Stroke stroke) in _removed)
+            {
+                strokes.Remove(stroke);
+            }
+        }
+
+        public void Revert(List<Stroke> strokes)
+        {
+            // Ascending order keeps each captured index valid: lower slots are refilled before we reach the
+            // higher ones, so every stroke lands back where it started.
+            foreach ((int index, Stroke stroke) in _removed)
+            {
+                strokes.Insert(index, stroke);
+            }
+        }
     }
 }
