@@ -19,6 +19,8 @@ public sealed class LatexToAngouriMathTests
     [InlineData("(x+1)(x-1)", "(x+1)*(x-1)")]
     [InlineData("-5", "-5")]
     [InlineData("3.14", "3.14")]
+    // Phase 5: a taffy splice emits negative trial values parenthesized ("2+(-3)"), never bare "+-".
+    [InlineData("2+(-3)", "2+(-3)")]
     // fractions
     [InlineData(@"\frac{1}{2}", "((1)/(2))")]
     [InlineData(@"\frac{x+1}{2}", "((x+1)/(2))")]
@@ -59,6 +61,8 @@ public sealed class LatexToAngouriMathTests
     // equations keep the relational operator
     [InlineData("2x+3=7", "2*x+3=7")]
     [InlineData("2+3=", "2+3=")]
+    // Phase 5: a parenthesized negative on the right-hand side (taffy splice of "x=5" scrubbed below 0).
+    [InlineData("x=(-5)", "x=(-5)")]
     public void TranslatesToAngouriMathSyntax(string latex, string expected)
     {
         Assert.Equal(expected, LatexToAngouriMath.Translate(latex));

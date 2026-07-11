@@ -1,4 +1,5 @@
 using Penumbra.Ink;
+using Penumbra.Recognition;
 
 namespace Penumbra.App;
 
@@ -41,4 +42,122 @@ public sealed record CausalityRipple(IReadOnlyList<CausalityRippleStep> Steps, l
 public sealed class AnswerTappedEventArgs(Guid ownerId) : EventArgs
 {
     public Guid OwnerId { get; } = ownerId;
+}
+
+/// <summary>
+/// Payload for a held-and-dragged answer being dropped to stamp into the document as real ink (Phase 5.3
+/// A1). Carries the world-space drag delta so the stamp lands exactly where the drag ghost showed, and the
+/// world-space drop point so the view-model can tell which existing line — if any — the answer landed on.
+/// </summary>
+/// <param name="ownerId">The answer owner (Sheet node / recognition-region id) being stamped.</param>
+/// <param name="worldDx">World-space horizontal distance from the grab point to the drop point.</param>
+/// <param name="worldDy">World-space vertical distance from the grab point to the drop point.</param>
+/// <param name="worldDropX">World-space X of the drop point.</param>
+/// <param name="worldDropY">World-space Y of the drop point.</param>
+public sealed class AnswerDragCompletedEventArgs(
+    Guid ownerId,
+    double worldDx,
+    double worldDy,
+    double worldDropX,
+    double worldDropY) : EventArgs
+{
+    public Guid OwnerId { get; } = ownerId;
+    public double WorldDx { get; } = worldDx;
+    public double WorldDy { get; } = worldDy;
+    public double WorldDropX { get; } = worldDropX;
+    public double WorldDropY { get; } = worldDropY;
+}
+
+/// <summary>One accepted line's grabbable numeric literals (Phase 5.3 interaction layer).</summary>
+/// <param name="OwnerId">The recognition-region / Sheet node the runs belong to.</param>
+/// <param name="Runs">The literal runs <see cref="LiteralRuns.Find"/> reported for that line's tokens.</param>
+public sealed record LiteralRunOwner(Guid OwnerId, IReadOnlyList<LiteralRun> Runs);
+
+/// <summary>
+/// An immutable snapshot of every accepted line's numeric literals — the data a "taffy" drag will grab
+/// (Phase 5.3). Published by the view-model, bound to the canvas, and validated again when a held literal
+/// begins taffy. <see cref="Sequence"/> forces a styled-property change even
+/// when two snapshots would otherwise compare equal, exactly as <see cref="AnswerAnimation.Sequence"/> does.
+/// </summary>
+public sealed record LiteralRunLayer(IReadOnlyList<LiteralRunOwner> Owners, long Sequence)
+{
+    public static LiteralRunLayer Empty { get; } = new(Array.Empty<LiteralRunOwner>(), 0);
+
+    /// <summary>Total run count across all owners — a cheap way to notice a prune actually changed something.</summary>
+    public int RunCount => Owners.Sum(owner => owner.Runs.Count);
+
+    /// <summary>
+    /// Drops any run whose source strokes are no longer all present in the document — an edited or erased
+    /// line must not stay grabbable at a stale value. Returns a layer carrying only the still-valid runs
+    /// (owners left with no runs drop out); <paramref name="sequence"/> stamps the pruned snapshot.
+    /// </summary>
+    public LiteralRunLayer PruneMissing(IReadOnlySet<Guid> presentStrokeIds, long sequence)
+    {
+        ArgumentNullException.ThrowIfNull(presentStrokeIds);
+
+        var owners = new List<LiteralRunOwner>(Owners.Count);
+        foreach (LiteralRunOwner owner in Owners)
+        {
+            LiteralRun[] kept = owner.Runs
+                .Where(run => run.SourceStrokeIds.All(presentStrokeIds.Contains))
+                .ToArray();
+            if (kept.Length > 0)
+            {
+                owners.Add(owner with { Runs = kept });
+            }
+        }
+
+        return new LiteralRunLayer(owners, sequence);
+    }
+}
+
+/// <summary>
+/// One static piece of hypothetical handwriting shown during a taffy gesture. Literal ghosts float
+/// above the grabbed source run; answer ghosts occupy the normal answer anchor for their query owner.
+/// They are presentation-only and never enter the document, animation timeline, or recognition cache.
+/// </summary>
+/// <param name="OwnerId">The Sheet node whose literal or trial result this ghost represents.</param>
+/// <param name="ValueText">The exact trial display value used to synthesize the ghost.</param>
+/// <param name="Handwriting">Final-frame handwriting; its timeline is deliberately never replayed.</param>
+/// <param name="IsLiteral">True for the grabbed literal itself; false for a downstream trial answer.</param>
+/// <param name="LiftScreenPx">Vertical lift applied by the canvas in screen pixels, keeping it zoom-invariant.</param>
+public sealed record TaffyGhost(
+    Guid OwnerId,
+    string ValueText,
+    SynthesizedHandwriting Handwriting,
+    bool IsLiteral,
+    double LiftScreenPx = 0);
+
+/// <summary>
+/// Immutable render snapshot for one active taffy session. Source literal strokes are muted, committed
+/// answers whose hypothetical value is being shown are hidden, and <see cref="Ghosts"/> supplies their
+/// static replacements. Absence of a layer means no active taffy session.
+/// </summary>
+/// <param name="MutedStrokeIds">The grabbed literal's source strokes, rendered dimly in place.</param>
+/// <param name="HiddenAnswerOwnerIds">Committed answer owners suppressed while trial ghosts are visible.</param>
+/// <param name="Ghosts">Static literal and answer ghosts for the current snapped value.</param>
+/// <param name="Sequence">Monotonic visual version, ensuring every accepted trial invalidates the canvas.</param>
+public sealed record TaffyGhostLayer(
+    IReadOnlySet<Guid> MutedStrokeIds,
+    IReadOnlySet<Guid> HiddenAnswerOwnerIds,
+    IReadOnlyList<TaffyGhost> Ghosts,
+    long Sequence);
+
+/// <summary>Payload for a held literal asking the ViewModel to begin a validated taffy session.</summary>
+public sealed class TaffyStartedEventArgs(Guid ownerId, LiteralRun run) : EventArgs
+{
+    public Guid OwnerId { get; } = ownerId;
+    public LiteralRun Run { get; } = run;
+
+    /// <summary>
+    /// Set synchronously by the host after validating that the run still belongs to the current document.
+    /// A rejected stale snapshot is consumed safely and restarts the recognition cancelled by pen-down.
+    /// </summary>
+    public bool Accepted { get; set; }
+}
+
+/// <summary>Screen-space cumulative horizontal motion for an active taffy gesture.</summary>
+public sealed class TaffyMovedEventArgs(double screenDx) : EventArgs
+{
+    public double ScreenDx { get; } = screenDx;
 }

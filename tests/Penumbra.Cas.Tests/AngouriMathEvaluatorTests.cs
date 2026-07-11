@@ -23,6 +23,8 @@ public sealed class AngouriMathEvaluatorTests
     [InlineData("2^{10}", "1024")]
     [InlineData(@"\frac{1}{3}", "1/3")]
     [InlineData("x-x", "0")]
+    // Phase 5: a taffy splice's parenthesized negative trial value must still compute end-to-end.
+    [InlineData("2+(-3)=", "-1")]
     public void EvaluatesNumericExpressions(string latex, string expected)
     {
         var result = Eval(latex);

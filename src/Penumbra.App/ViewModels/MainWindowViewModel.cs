@@ -2,6 +2,7 @@ using Avalonia.Threading;
 using CommunityToolkit.Mvvm.ComponentModel;
 using CommunityToolkit.Mvvm.Input;
 using Penumbra.Cas;
+using Penumbra.Cas.Latex;
 using Penumbra.Core;
 using Penumbra.Ink;
 using Penumbra.Recognition;
@@ -20,6 +21,7 @@ public partial class MainWindowViewModel : ViewModelBase, IDisposable
     private const string IdleHint = "Write expressions on separate lines — queries ending in '=' answer when you pause";
 
     internal static readonly TimeSpan LiveQuietPeriod = TimeSpan.FromSeconds(1);
+    internal static readonly TimeSpan TaffyProbeFloor = TimeSpan.FromMilliseconds(33);
 
     // s19 dogfood: an erase is usually the first half of "erase, then rewrite". Recomputing on the
     // normal quiet period races the user — the half-edited line ('x=' with its value gone) recognizes,
@@ -33,17 +35,33 @@ public partial class MainWindowViewModel : ViewModelBase, IDisposable
     private readonly HandwritingSynthesizer? _synthesizer;
     private readonly RecognitionCalibration _calibration;
     private readonly Debouncer _liveDebouncer;
+    private readonly TimeProvider _time;
     private readonly HashSet<string> _bankedStrokeSets = new();
+
+    // 5.3 A1: strokes that entered the document as a stamped answer, this session only. They must never
+    // feed the glyph bank — a re-inked answer is not fresh handwriting evidence, and banking the
+    // synthesizer's own output would drift the corpus (jitter of jitter). Not persisted (accepted A1 limit).
+    private readonly HashSet<Guid> _stampedStrokeIds = new();
 
     // This list is the recognizer's complete round-trip state, including rejected regions. It is replaced
     // only by an atomically applied latest pass; a cancelled/superseded result never becomes cache authority.
     private IReadOnlyList<RegionRecognition> _previousRegions = Array.Empty<RegionRecognition>();
+
+    // 5.3 A1: the accepted regions of the last applied pass — the candidate drop lines a stamped answer can
+    // snap to (bounds drive the y-overlap test, tokens the target line height). Kept separate from
+    // _previousRegions so recognition-cache semantics are never touched.
+    private IReadOnlyList<RegionRecognition> _lastAppliedRegions = Array.Empty<RegionRecognition>();
     private CancellationTokenSource? _recognitionCts;
     private long _recognitionGeneration;
     private long _visualSequence;
     private bool _suppressDocumentChanged;
     private int _lastKnownStrokeCount;
     private bool _disposed;
+
+    // 5.3 A2: one non-mutating taffy session. The cache lives only for that gesture: repeated snapped
+    // values reuse byte-identical geometry (no shimmer), while a later gesture revalidates anchors/strokes.
+    private TaffySession? _taffySession;
+    private readonly Dictionary<TaffyGhostCacheKey, SynthesizedHandwriting?> _taffyGhostCache = new();
 
     public MainWindowViewModel()
         : this(
@@ -60,7 +78,8 @@ public partial class MainWindowViewModel : ViewModelBase, IDisposable
         SheetGraph sheet,
         IGlyphBank? glyphBank = null,
         HandwritingSynthesizer? synthesizer = null,
-        RecognitionCalibration? calibration = null)
+        RecognitionCalibration? calibration = null,
+        TimeProvider? time = null)
     {
         ArgumentNullException.ThrowIfNull(regionRecognizer);
         ArgumentNullException.ThrowIfNull(sheet);
@@ -70,12 +89,18 @@ public partial class MainWindowViewModel : ViewModelBase, IDisposable
         _glyphBank = glyphBank;
         _synthesizer = synthesizer;
         _calibration = calibration ?? RecognitionCalibration.Default;
+        _time = time ?? TimeProvider.System;
 
         Document = new InkDocument();
         Document.Changed += (_, _) => OnDocumentChanged();
+
+        // The debounce clock is injectable so the live-recognition timing — including the 5.3 drag-cancel
+        // re-signal — is proven on fake time, exactly as Penumbra.Core's DebouncerTests do. Production
+        // passes nothing and gets the system clock.
         _liveDebouncer = new Debouncer(
             LiveQuietPeriod,
-            () => Dispatcher.UIThread.Post(() => _ = RecognizeCoreAsync(RecognitionMode.Live)));
+            () => Dispatcher.UIThread.Post(() => _ = RecognizeCoreAsync(RecognitionMode.Live)),
+            time);
     }
 
     public InkDocument Document { get; }
@@ -92,6 +117,20 @@ public partial class MainWindowViewModel : ViewModelBase, IDisposable
 
     [ObservableProperty]
     private CausalityRipple? _causalityRipple;
+
+    /// <summary>5.3: current per-line numeric literals published for validated canvas hit-testing.</summary>
+    [ObservableProperty]
+    private LiteralRunLayer _literalRunLayer = LiteralRunLayer.Empty;
+
+    /// <summary>
+    /// Static hypothetical ink for the active taffy gesture, or null outside one. This layer is never
+    /// persisted, replayed, banked, recognized, or inserted into <see cref="Document"/>.
+    /// </summary>
+    [ObservableProperty]
+    private TaffyGhostLayer? _taffyGhostLayer;
+
+    internal bool IsTaffyActive => _taffySession is not null;
+    internal int TaffyProbeCount { get; private set; }
 
     [ObservableProperty]
     private bool _liveRecognition = true;
@@ -125,6 +164,298 @@ public partial class MainWindowViewModel : ViewModelBase, IDisposable
         ProvenanceStrokeIds = node is null
             ? NoStrokes
             : node.Tokens.SelectMany(token => token.SourceStrokeIds).ToHashSet();
+    }
+
+    /// <summary>
+    /// 5.3 A1 (D9): stamps a dragged answer into the document as real ink — the one and only path by which
+    /// answer ink enters <see cref="Document"/>. Copies the owner's already-synthesized strokes (never
+    /// re-synthesizing), translates them by the drag delta so they land where the ghost showed, and — when
+    /// the drop y-overlaps an existing line — rescales them about their own centre to match that line's
+    /// glyph height. A direct drop on a recognized literal atomically replaces that literal's source ink;
+    /// other safe drops append. Both are ONE undoable edit. A far-horizontal drop in an existing line's
+    /// Y-band is refused because today's one-expression-per-line segmenter would merge it despite the visual
+    /// whitespace. Every fresh id is recorded so re-inked values are never banked (D10). The resulting
+    /// <see cref="InkDocument.Changed"/> drives normal recognition; this method never writes the graph.
+    /// </summary>
+    public void StampAnswer(Guid ownerId, double dx, double dy, double dropX, double dropY)
+    {
+        AnswerAnimation? answer = AnswerLayer.Answers.FirstOrDefault(a => a.OwnerId == ownerId);
+        IReadOnlyList<Stroke>? source = answer?.Handwriting.Strokes;
+        if (source is null || source.Count == 0)
+        {
+            return;
+        }
+
+        if (!TryStrokeBounds(source, out double minX, out double minY, out double maxX, out double maxY))
+        {
+            return;
+        }
+
+        double centreX = (minX + maxX) / 2;
+        double centreY = (minY + maxY) / 2;
+
+        RegionRecognition? targetRegion = DropTargetRegion(dropY);
+        LiteralDropTarget? targetLiteral = LiteralTargetAt(dropX, dropY);
+
+        // Match the target line's glyph height when dropped onto one; otherwise keep the answer's own size.
+        double scale = 1.0;
+        double sourceHeight = maxY - minY;
+        if (sourceHeight > 0 && targetRegion is not null)
+        {
+            scale = ClampedMedianTokenHeight(targetRegion.Result.Tokens) / sourceHeight;
+        }
+
+        IReadOnlyList<Stroke> stamped = StrokeTransformer.Transform(source, dx, dy, scale, centreX, centreY);
+        if (targetRegion is not null && targetLiteral is null && !IsNearLine(stamped, targetRegion))
+        {
+            // Regions are intentionally one expression per horizontal line. Ink far to the side but in the
+            // same Y band would still merge into that expression; refuse instead of silently corrupting it.
+            RecognitionText = "That space belongs to an existing line — move vertically to create a new line.";
+            NotifyAnswerDragCancelled();
+            return;
+        }
+
+        foreach (Stroke stroke in stamped)
+        {
+            _stampedStrokeIds.Add(stroke.Id);
+        }
+
+        if (targetRegion?.Region.Id == ownerId)
+        {
+            // The committed answer and its real-ink copy would otherwise overlap until the debounced read
+            // reclassifies the source line as a statement. Hide it immediately; recognition may restore it
+            // if the resulting line remains a query.
+            AnswerLayer = new AnswerLayer(AnswerLayer.Answers.Where(item => item.OwnerId != ownerId).ToArray());
+        }
+
+        if (targetLiteral is not null)
+        {
+            Document.ReplaceStrokes(targetLiteral.Run.SourceStrokeIds, stamped);
+        }
+        else
+        {
+            Document.AddStrokes(stamped);
+        }
+    }
+
+    /// <summary>
+    /// 5.3 A1 (D8): call when an answer drag was abandoned without stamping (dropped back within the start
+    /// slop, or Escape). The grab's pen-down already cancelled any pending live read, and a cancelled drag
+    /// mutates nothing, so nothing else would restart it — re-signal the debouncer to restore that eaten
+    /// pass. A completed stamp needs no such call: its <see cref="InkDocument.Changed"/> re-signals naturally.
+    /// </summary>
+    public void NotifyAnswerDragCancelled()
+    {
+        if (Document.Strokes.Count > 0 && LiveRecognition)
+        {
+            _liveDebouncer.Signal(LiveQuietPeriod);
+        }
+    }
+
+    /// <summary>
+    /// Starts a non-mutating taffy session for a literal from the current <see cref="LiteralRunLayer"/>.
+    /// The snapshot is accepted only while its owner, token span, value, and every source stroke still match
+    /// the committed page. On success the original literal is muted and a lifted static copy is shown; no
+    /// graph probe occurs until horizontal motion crosses a snapped value boundary.
+    /// </summary>
+    public bool BeginTaffy(Guid ownerId, LiteralRun run)
+    {
+        ArgumentNullException.ThrowIfNull(run);
+        EndTaffyCore(resignalRecognition: false);
+
+        SheetNode? node = _sheet.Find(ownerId);
+        LiteralRun? current = LiteralRunLayer.Owners
+            .FirstOrDefault(owner => owner.OwnerId == ownerId)
+            ?.Runs.FirstOrDefault(candidate => SameRun(candidate, run));
+        if (node is null || current is null
+            || current.TokenStart < 0
+            || current.TokenStart + current.TokenCount > node.Tokens.Count)
+        {
+            return false;
+        }
+
+        HashSet<Guid> present = Document.Strokes.Select(stroke => stroke.Id).ToHashSet();
+        if (current.SourceStrokeIds.Count == 0 || current.SourceStrokeIds.Any(id => !present.Contains(id)))
+        {
+            return false;
+        }
+
+        _taffyGhostCache.Clear();
+        TaffyProbeCount = 0;
+        DateTimeOffset now = _time.GetUtcNow();
+        _taffySession = new TaffySession(
+            ownerId,
+            current,
+            node.Tokens.ToArray(),
+            current.ValueText,
+            current.ValueText,
+            now - TaffyProbeFloor);
+        PublishTaffyLayer(_taffySession, current.ValueText, report: null);
+        return true;
+    }
+
+    /// <summary>
+    /// Updates the active taffy trial from cumulative screen-space horizontal motion. Mapping always starts
+    /// from the originally recognized literal, probes only when the snapped value changes, and enforces a
+    /// 33 ms floor between probes. The Sheet probe and all synthesized ghosts are scratch presentation state;
+    /// committed nodes, recognition round-trip state, answers, document ink, and undo history stay untouched.
+    /// </summary>
+    public void UpdateTaffy(double screenDx)
+    {
+        TaffySession? session = _taffySession;
+        if (session is null)
+        {
+            return;
+        }
+
+        string valueText;
+        try
+        {
+            valueText = TaffyValueMapper.Map(session.OriginalValueText, screenDx);
+        }
+        catch (Exception ex) when (ex is FormatException or OverflowException)
+        {
+            return; // An out-of-range recognized literal is honestly non-scrubbable, never an app crash.
+        }
+
+        if (string.Equals(valueText, session.LastValueText, StringComparison.Ordinal))
+        {
+            return;
+        }
+
+        DateTimeOffset now = _time.GetUtcNow();
+        if (now - session.LastProbeAt < TaffyProbeFloor)
+        {
+            return;
+        }
+
+        string trialLatex = LiteralRuns.Splice(session.Tokens, session.Run, valueText);
+        SheetProbeReport report = _sheet.Probe(session.OwnerId, trialLatex);
+        session.LastValueText = valueText;
+        session.LastProbeAt = now;
+        TaffyProbeCount++;
+        PublishTaffyLayer(session, valueText, report);
+    }
+
+    /// <summary>
+    /// Ends taffy without committing its hypothetical state. The presentation layer and per-gesture cache
+    /// are discarded, then the normal live debounce is re-signalled because the original pen-down cancelled
+    /// a pending read even though the gesture never changed the document.
+    /// </summary>
+    public void EndTaffy() => EndTaffyCore(resignalRecognition: true);
+
+    private void EndTaffyCore(bool resignalRecognition)
+    {
+        bool wasActive = _taffySession is not null;
+        _taffySession = null;
+        _taffyGhostCache.Clear();
+        TaffyGhostLayer = null;
+        if (wasActive && resignalRecognition)
+        {
+            NotifyAnswerDragCancelled();
+        }
+    }
+
+    private static bool SameRun(LiteralRun a, LiteralRun b) =>
+        a.TokenStart == b.TokenStart
+        && a.TokenCount == b.TokenCount
+        && string.Equals(a.ValueText, b.ValueText, StringComparison.Ordinal)
+        && a.SourceStrokeIds.SequenceEqual(b.SourceStrokeIds);
+
+    // The accepted line the drop landed on (y-overlap of its bounds, padded half a line), or null for empty
+    // space. When several overlap, the one whose centre is nearest the drop wins. Tokens drive the height.
+    private RegionRecognition? DropTargetRegion(double dropY)
+    {
+        RegionRecognition? best = null;
+        double bestDistance = double.MaxValue;
+        foreach (RegionRecognition region in _lastAppliedRegions)
+        {
+            InkBounds bounds = region.Region.Bounds;
+            double pad = bounds.Height * 0.5;
+            if (dropY < bounds.Y - pad || dropY > bounds.Y + bounds.Height + pad)
+            {
+                continue;
+            }
+
+            double distance = Math.Abs(dropY - (bounds.Y + bounds.Height / 2));
+            if (distance < bestDistance)
+            {
+                bestDistance = distance;
+                best = region;
+            }
+        }
+
+        return best;
+    }
+
+    // A direct drop on a recognized literal means replacement, not over-drawing. A modest fraction-of-glyph
+    // pad absorbs hand placement imprecision without turning adjacent insertion positions into replacements.
+    private LiteralDropTarget? LiteralTargetAt(double dropX, double dropY)
+    {
+        LiteralDropTarget? best = null;
+        double bestDistance = double.MaxValue;
+        HashSet<Guid> present = Document.Strokes.Select(stroke => stroke.Id).ToHashSet();
+        foreach (LiteralRunOwner owner in LiteralRunLayer.Owners)
+        {
+            foreach (LiteralRun run in owner.Runs)
+            {
+                InkBounds bounds = run.UnionBounds;
+                double pad = Math.Max(8, bounds.Height * 0.35);
+                bool inside = dropX >= bounds.X - pad && dropX <= bounds.X + bounds.Width + pad
+                    && dropY >= bounds.Y - pad && dropY <= bounds.Y + bounds.Height + pad;
+                if (!inside || run.SourceStrokeIds.Count == 0 || run.SourceStrokeIds.Any(id => !present.Contains(id)))
+                {
+                    continue;
+                }
+
+                double dx = dropX - (bounds.X + bounds.Width / 2);
+                double dy = dropY - (bounds.Y + bounds.Height / 2);
+                double distance = dx * dx + dy * dy;
+                if (distance < bestDistance)
+                {
+                    bestDistance = distance;
+                    best = new LiteralDropTarget(owner.OwnerId, run);
+                }
+            }
+        }
+
+        return best;
+    }
+
+    private static bool IsNearLine(IReadOnlyList<Stroke> stamped, RegionRecognition target)
+    {
+        if (!TryStrokeBounds(stamped, out double minX, out _, out double maxX, out _))
+        {
+            return false;
+        }
+
+        InkBounds bounds = target.Region.Bounds;
+        double gap = maxX < bounds.X
+            ? bounds.X - maxX
+            : minX > bounds.X + bounds.Width ? minX - (bounds.X + bounds.Width) : 0;
+        double lineHeight = ClampedMedianTokenHeight(target.Result.Tokens);
+        return gap <= Math.Max(24, lineHeight * 0.75);
+    }
+
+    private static bool TryStrokeBounds(
+        IReadOnlyList<Stroke> strokes, out double minX, out double minY, out double maxX, out double maxY)
+    {
+        minX = minY = double.MaxValue;
+        maxX = maxY = double.MinValue;
+        bool any = false;
+        foreach (Stroke stroke in strokes)
+        {
+            foreach (StrokeSample sample in stroke.Samples)
+            {
+                any = true;
+                minX = Math.Min(minX, sample.X);
+                minY = Math.Min(minY, sample.Y);
+                maxX = Math.Max(maxX, sample.X);
+                maxY = Math.Max(maxY, sample.Y);
+            }
+        }
+
+        return any;
     }
 
     [RelayCommand(CanExecute = nameof(CanRecognize))]
@@ -199,10 +530,15 @@ public partial class MainWindowViewModel : ViewModelBase, IDisposable
             _sheet.Remove(id);
         }
 
-        foreach (RegionRecognition region in regions.Where(r => accepted.ContainsKey(r.Region.Id)))
+        RegionRecognition[] acceptedRegions = regions.Where(r => accepted.ContainsKey(r.Region.Id)).ToArray();
+        foreach (RegionRecognition region in acceptedRegions)
         {
             _sheet.Upsert(region.Region.Id, region.Result.Latex, region.Result.Tokens, region.Region.Bounds);
         }
+
+        // 5.3: snapshot accepted lines as stamp targets and publish the literal boxes taffy will validate.
+        _lastAppliedRegions = acceptedRegions;
+        PublishLiteralRunLayer(acceptedRegions);
 
         RecomputeReport report = _sheet.RecomputeDetailed();
         HashSet<Guid> dirtySources = regions.Where(region => region.Dirty).Select(region => region.Region.Id).ToHashSet();
@@ -220,6 +556,41 @@ public partial class MainWindowViewModel : ViewModelBase, IDisposable
         if (mode != RecognitionMode.Load)
         {
             BankNewCompletedQueries(regions, strokeSnapshot);
+        }
+    }
+
+    // 5.3 A1: publishes one grabbable-literals owner per accepted line that has any numeric literal.
+    private void PublishLiteralRunLayer(IReadOnlyList<RegionRecognition> acceptedRegions)
+    {
+        var owners = new List<LiteralRunOwner>(acceptedRegions.Count);
+        foreach (RegionRecognition region in acceptedRegions)
+        {
+            IReadOnlyList<LiteralRun> runs = LiteralRuns.Find(region.Result.Tokens);
+            if (runs.Count > 0)
+            {
+                owners.Add(new LiteralRunOwner(region.Region.Id, runs));
+            }
+        }
+
+        LiteralRunLayer = new LiteralRunLayer(owners, ++_visualSequence);
+    }
+
+    // 5.3 A1 stale-run guard: after any document edit, drop runs whose source strokes no longer all exist,
+    // so an erased/rewritten line can never stay grabbable at a stale value. Republished only when the edit
+    // actually invalidated a run, keeping the sequence meaningful.
+    private void PruneLiteralRunLayer()
+    {
+        if (LiteralRunLayer.RunCount == 0)
+        {
+            return;
+        }
+
+        HashSet<Guid> present = Document.Strokes.Select(stroke => stroke.Id).ToHashSet();
+        LiteralRunLayer pruned = LiteralRunLayer.PruneMissing(present, _visualSequence + 1);
+        if (pruned.RunCount != LiteralRunLayer.RunCount)
+        {
+            _visualSequence++;
+            LiteralRunLayer = pruned;
         }
     }
 
@@ -265,8 +636,36 @@ public partial class MainWindowViewModel : ViewModelBase, IDisposable
         AnswerLayer = new AnswerLayer(current.Values.OrderBy(answer => answer.Sequence).ToArray());
     }
 
-    private static bool IsAnswerableQuery(SheetNode node) =>
-        node.Role == NodeRole.Query && !node.IsConflict && node.Result is { IsComputed: true };
+    private static bool IsAnswerableQuery(SheetNode node)
+    {
+        return node.Result is { } result && IsUsefulQueryResult(node, result);
+    }
+
+    private static bool IsUsefulQueryResult(SheetNode node, EvaluationResult result)
+    {
+        if (node.Role != NodeRole.Query || node.IsConflict || !result.IsComputed)
+        {
+            return false;
+        }
+
+        if (result.Kind != EvaluationKind.Symbolic)
+        {
+            return true;
+        }
+
+        // An unresolved identity (`y=` → `y`, `y-2=` → `y-2`) is not an answer; drawing it duplicates
+        // the user's line and interferes with answer stamping. A real symbolic simplification (`y+y=` →
+        // `2y`) still materializes because the translated surfaces differ.
+        string queryExpression = node.Latex.TrimEnd();
+        if (queryExpression.EndsWith('=') && !queryExpression.EndsWith("==", StringComparison.Ordinal))
+        {
+            queryExpression = queryExpression[..^1];
+        }
+
+        string input = LatexToAngouriMath.Translate(queryExpression);
+        string output = LatexToAngouriMath.Translate(result.Latex);
+        return !string.Equals(input, output, StringComparison.Ordinal);
+    }
 
     private void UpdateRipple(RecomputeReport report, IReadOnlySet<Guid> dirtySources, RecognitionMode mode)
     {
@@ -310,6 +709,13 @@ public partial class MainWindowViewModel : ViewModelBase, IDisposable
                 DateTimeOffset.UtcNow,
                 _bankedStrokeSets))
             {
+                // 5.3 A1 (D10): never bank a sample drawn from stamped answer ink — it is the synthesizer's
+                // own output re-read, not fresh handwriting, and banking it would drift the corpus.
+                if (_stampedStrokeIds.Count > 0 && sample.Strokes.Any(stroke => _stampedStrokeIds.Contains(stroke.Id)))
+                {
+                    continue;
+                }
+
                 _glyphBank.Capture(sample);
             }
         }
@@ -370,6 +776,119 @@ public partial class MainWindowViewModel : ViewModelBase, IDisposable
             : new AnswerAnimation(ownerId, synthesized, ++_visualSequence, play);
     }
 
+    // Builds one complete immutable taffy frame. The grabbed literal is always represented (when its
+    // glyphs exist); affected query owners hide their committed answers even when the trial errors, so a
+    // stale numeric answer can never masquerade as the hypothetical result.
+    private void PublishTaffyLayer(TaffySession session, string literalValue, SheetProbeReport? report)
+    {
+        var ghosts = new List<TaffyGhost>();
+        SynthesizedHandwriting? literal = TryBuildTaffyHandwriting(
+            new TaffyGhostCacheKey(session.OwnerId, literalValue, IsLiteral: true),
+            HandwritingText.FromDisplayText(literalValue),
+            LiteralSpawn(session.Run, session.Tokens));
+        if (literal is not null)
+        {
+            ghosts.Add(new TaffyGhost(session.OwnerId, literalValue, literal, IsLiteral: true, LiftScreenPx: 10));
+        }
+
+        HashSet<Guid> committedAnswerOwners = AnswerLayer.Answers.Select(answer => answer.OwnerId).ToHashSet();
+        var hidden = new HashSet<Guid>();
+        if (report is not null)
+        {
+            foreach (ProbeEntry entry in report.Entries)
+            {
+                Guid ownerId = entry.Node.Id;
+                if (committedAnswerOwners.Contains(ownerId))
+                {
+                    hidden.Add(ownerId);
+                }
+
+                if (!IsUsefulQueryResult(entry.Node, entry.TrialResult))
+                {
+                    continue;
+                }
+
+                (InkBounds Anchor, double LineHeight)? spawn = FindSpawn(entry.Node.Tokens);
+                if (spawn is null)
+                {
+                    continue;
+                }
+
+                string valueText = entry.TrialResult.DisplayText;
+                SynthesizedHandwriting? answer = TryBuildTaffyHandwriting(
+                    new TaffyGhostCacheKey(ownerId, valueText, IsLiteral: false),
+                    HandwritingText.FromDisplayText(valueText),
+                    spawn.Value);
+                if (answer is not null)
+                {
+                    ghosts.Add(new TaffyGhost(ownerId, valueText, answer, IsLiteral: false));
+                }
+            }
+        }
+
+        TaffyGhostLayer = new TaffyGhostLayer(
+            session.Run.SourceStrokeIds.ToHashSet(),
+            hidden,
+            ghosts,
+            ++_visualSequence);
+    }
+
+    // Positions the first synthesized glyph at the literal's left edge. The canvas applies the vertical
+    // lift in screen pixels so zoom never changes the perceived pickup distance.
+    private static (InkBounds Anchor, double LineHeight) LiteralSpawn(
+        LiteralRun run,
+        IReadOnlyList<RecognizedToken> tokens)
+    {
+        double lineHeight = ClampedMedianTokenHeight(tokens);
+        double gap = new SynthesisOptions().GapAfterAnchor * lineHeight;
+        return (new InkBounds(run.UnionBounds.X - gap, run.UnionBounds.Y, 0, run.UnionBounds.Height), lineHeight);
+    }
+
+    private SynthesizedHandwriting? TryBuildTaffyHandwriting(
+        TaffyGhostCacheKey key,
+        string text,
+        (InkBounds Anchor, double LineHeight) spawn)
+    {
+        if (_taffyGhostCache.TryGetValue(key, out SynthesizedHandwriting? cached))
+        {
+            return cached;
+        }
+
+        SynthesizedHandwriting? synthesized = _synthesizer?.Synthesize(
+            text,
+            spawn.Anchor,
+            new SynthesisOptions { LineHeight = spawn.LineHeight },
+            new Random(StableTaffySeed(key)));
+        if (synthesized is { MissingSymbols.Count: > 0 })
+        {
+            synthesized = null;
+        }
+
+        _taffyGhostCache[key] = synthesized;
+        return synthesized;
+    }
+
+    // string.GetHashCode is process-randomized; this small FNV-1a seed is stable across runs and platforms.
+    private static int StableTaffySeed(TaffyGhostCacheKey key)
+    {
+        unchecked
+        {
+            uint hash = 2166136261;
+            foreach (byte value in key.OwnerId.ToByteArray())
+            {
+                hash = (hash ^ value) * 16777619;
+            }
+
+            foreach (char value in key.ValueText)
+            {
+                hash = (hash ^ value) * 16777619;
+            }
+
+            hash = (hash ^ (key.IsLiteral ? 1u : 0u)) * 16777619;
+            return (int)(hash & 0x7FFFFFFF);
+        }
+    }
+
     internal static (InkBounds Anchor, double LineHeight)? FindSpawn(IReadOnlyList<RecognizedToken> tokens)
     {
         int equalsIndex = -1;
@@ -379,11 +898,22 @@ public partial class MainWindowViewModel : ViewModelBase, IDisposable
         }
 
         if (equalsIndex < 0) return null;
+        return (tokens[equalsIndex].Bounds, ClampedMedianTokenHeight(tokens));
+    }
+
+    /// <summary>
+    /// A line's representative glyph height: the clamped median height of its non-<c>=</c> tokens (the
+    /// <c>=</c> is excluded because its bounds don't track the digits' size). Clamped to [24, 96] and
+    /// defaulting to 48 for a line with no sizeable tokens. Shared by answer spawning and 5.3 stamp
+    /// rescaling so a stamped answer matches the line it lands on the same way a fresh answer is sized.
+    /// </summary>
+    internal static double ClampedMedianTokenHeight(IReadOnlyList<RecognizedToken> tokens)
+    {
         double[] heights = tokens.Where(token => token.Latex != "=").Select(token => token.Bounds.Height).Order().ToArray();
         double median = heights.Length == 0
             ? 48
             : heights.Length % 2 == 1 ? heights[heights.Length / 2] : (heights[heights.Length / 2 - 1] + heights[heights.Length / 2]) / 2;
-        return (tokens[equalsIndex].Bounds, Math.Clamp(median, 24, 96));
+        return Math.Clamp(median, 24, 96);
     }
 
     /// <summary>Builds schema v3 from raw ink plus neutral cache snapshots; no graph edges are serialized.</summary>
@@ -419,6 +949,7 @@ public partial class MainWindowViewModel : ViewModelBase, IDisposable
     public async Task LoadDocumentAsync(PenumbraDocument document)
     {
         ArgumentNullException.ThrowIfNull(document);
+        EndTaffyCore(resignalRecognition: false);
         _liveDebouncer.Cancel();
         CancelRecognition();
         ++_recognitionGeneration;
@@ -434,7 +965,9 @@ public partial class MainWindowViewModel : ViewModelBase, IDisposable
 
         _bankedStrokeSets.Clear();
         _previousRegions = BuildValidLoadCache(document);
+        _lastAppliedRegions = Array.Empty<RegionRecognition>();
         AnswerLayer = AnswerLayer.Empty;
+        LiteralRunLayer = LiteralRunLayer.Empty;
         CausalityRipple = null;
         ProvenanceStrokeIds = NoStrokes;
         await RecognizeCoreAsync(RecognitionMode.Load);
@@ -524,6 +1057,10 @@ public partial class MainWindowViewModel : ViewModelBase, IDisposable
         RecognizeCommand.NotifyCanExecuteChanged();
         if (_suppressDocumentChanged) return;
 
+        // A taffy frame describes the exact committed stroke/token snapshot at grab time. Any document edit
+        // invalidates it immediately; the edit's own debounce replaces the no-op end re-signal.
+        EndTaffyCore(resignalRecognition: false);
+
         // Undo/redo, clear, load-adjacent hosts, and programmatic InkDocument edits do not pass through
         // NotifyStrokeStarted. They still invalidate an in-flight snapshot immediately: allowing that
         // stale pass to apply until the next debounce would briefly restore erased values/answers.
@@ -534,9 +1071,15 @@ public partial class MainWindowViewModel : ViewModelBase, IDisposable
         {
             ResetTransientState();
         }
-        else if (LiveRecognition)
+        else
         {
-            _liveDebouncer.Signal(QuietPeriodFor(previousStrokeCount, Document.Strokes.Count));
+            // 5.3 A1: keep the grabbable-literals layer honest between recognition passes — a stroke that
+            // just vanished must not leave its line grabbable at a stale value.
+            PruneLiteralRunLayer();
+            if (LiveRecognition)
+            {
+                _liveDebouncer.Signal(QuietPeriodFor(previousStrokeCount, Document.Strokes.Count));
+            }
         }
     }
 
@@ -555,7 +1098,10 @@ public partial class MainWindowViewModel : ViewModelBase, IDisposable
         foreach (Guid id in _sheet.Nodes.Select(node => node.Id).ToArray()) _sheet.Remove(id);
         _sheet.RecomputeDetailed();
         _previousRegions = Array.Empty<RegionRecognition>();
+        _lastAppliedRegions = Array.Empty<RegionRecognition>();
         AnswerLayer = AnswerLayer.Empty;
+        LiteralRunLayer = LiteralRunLayer.Empty;
+        EndTaffyCore(resignalRecognition: false);
         CausalityRipple = null;
         UncertainStrokeIds = NoStrokes;
         ProvenanceStrokeIds = NoStrokes;
@@ -575,10 +1121,30 @@ public partial class MainWindowViewModel : ViewModelBase, IDisposable
         if (_disposed) return;
         _disposed = true;
         _liveDebouncer.Dispose();
+        EndTaffyCore(resignalRecognition: false);
         CancelRecognition();
     }
 
     private enum RecognitionMode { Live, Manual, Load }
+
+    private sealed class TaffySession(
+        Guid ownerId,
+        LiteralRun run,
+        IReadOnlyList<RecognizedToken> tokens,
+        string originalValueText,
+        string lastValueText,
+        DateTimeOffset lastProbeAt)
+    {
+        public Guid OwnerId { get; } = ownerId;
+        public LiteralRun Run { get; } = run;
+        public IReadOnlyList<RecognizedToken> Tokens { get; } = tokens;
+        public string OriginalValueText { get; } = originalValueText;
+        public string LastValueText { get; set; } = lastValueText;
+        public DateTimeOffset LastProbeAt { get; set; } = lastProbeAt;
+    }
+
+    private readonly record struct TaffyGhostCacheKey(Guid OwnerId, string ValueText, bool IsLiteral);
+    private sealed record LiteralDropTarget(Guid OwnerId, LiteralRun Run);
 
     private sealed class EmptyRegionRecognizer : IRegionRecognizer
     {

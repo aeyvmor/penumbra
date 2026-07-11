@@ -61,6 +61,8 @@
         <controls:InkCanvasControl x:Name="InkCanvas"
                                    Document="{Binding Document}"
                                    AnswerLayer="{Binding AnswerLayer}"
+                                   LiteralRunLayer="{Binding LiteralRunLayer}"
+                                   TaffyGhostLayer="{Binding TaffyGhostLayer}"
                                    CausalityRipple="{Binding CausalityRipple}"
                                    IsEraseMode="{Binding IsEraseMode}"
                                    UncertainStrokeIds="{Binding UncertainStrokeIds}"

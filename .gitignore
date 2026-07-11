@@ -65,3 +65,4 @@ desktop.ini
 # ---- Logs / temp ----
 *.log
 *.tmp
+.claude/worktrees/

@@ -8,6 +8,7 @@ using Avalonia.Threading;
 using Avalonia.VisualTree;
 using Penumbra.Core;
 using Penumbra.Ink;
+using Penumbra.Recognition;
 
 namespace Penumbra.App.Controls;
 
@@ -40,11 +41,36 @@ public sealed class InkCanvasControl : Control
     public static readonly StyledProperty<IReadOnlySet<Guid>?> ProvenanceStrokeIdsProperty =
         AvaloniaProperty.Register<InkCanvasControl, IReadOnlySet<Guid>?>(nameof(ProvenanceStrokeIds));
 
+    // 5.3: per-line grabbable numeric literals. Answer ink wins hit-testing; these boxes drive taffy holds.
+    public static readonly StyledProperty<LiteralRunLayer?> LiteralRunLayerProperty =
+        AvaloniaProperty.Register<InkCanvasControl, LiteralRunLayer?>(nameof(LiteralRunLayer));
+
+    public static readonly StyledProperty<TaffyGhostLayer?> TaffyGhostLayerProperty =
+        AvaloniaProperty.Register<InkCanvasControl, TaffyGhostLayer?>(nameof(TaffyGhostLayer));
+
     /// <summary>4.5b: the user just started drawing a stroke (pen/mouse down) — live reads go stale now.</summary>
     public event EventHandler? DrawingStarted;
 
     /// <summary>4.5d: the user tapped the played answer (the tap is consumed, not inked).</summary>
     public event EventHandler<AnswerTappedEventArgs>? AnswerTapped;
+
+    /// <summary>5.3 A1: a held answer was dragged and dropped — stamp its value into the document as ink.</summary>
+    public event EventHandler<AnswerDragCompletedEventArgs>? AnswerDragCompleted;
+
+    /// <summary>
+    /// 5.3 A1: an armed answer drag was abandoned (dropped back within its start slop, or Escape) — nothing
+    /// is stamped, but the view-model must re-signal the recognition it eaten when the grab began.
+    /// </summary>
+    public event EventHandler? AnswerDragCancelled;
+
+    /// <summary>5.3 A2: a held current literal asks the host to validate and begin a taffy session.</summary>
+    public event EventHandler<TaffyStartedEventArgs>? TaffyStarted;
+
+    /// <summary>5.3 A2: cumulative zoom-independent horizontal motion for the active taffy session.</summary>
+    public event EventHandler<TaffyMovedEventArgs>? TaffyMoved;
+
+    /// <summary>5.3 A2: the active taffy gesture ended or was cancelled; all trial state must revert.</summary>
+    public event EventHandler? TaffyEnded;
 
     // Wall-clock → animation-time multiplier. Captured pen pace can feel sluggish; bump this to speed up the
     // "write-itself" playback. One named knob so tuning later is a single-line change.
@@ -58,6 +84,15 @@ public sealed class InkCanvasControl : Control
     private const double TapSlopScreenPx = 6;
     private const double TapToleranceScreenPx = 12;
     private const double EraserToleranceScreenPx = 14;
+
+    // 5.3 A1 hold-to-grab, in SCREEN units so the gesture feels identical at any zoom: press on an answer
+    // and hold within GrabSlopScreenPx for GrabHoldDuration to lift it; move past the slop first and it is
+    // a plain ink stroke. GrabLiftScreenPx raises the drag ghost a touch so a grabbed answer reads as
+    // "picked up off the page".
+    private static readonly TimeSpan GrabHoldDuration = TimeSpan.FromMilliseconds(300);
+    private const double GrabSlopScreenPx = 8;
+    private const double GrabLiftScreenPx = 5;
+
     private static readonly TimeSpan RippleStepDuration = TimeSpan.FromMilliseconds(150);
     private static readonly TimeSpan RippleHoldDuration = TimeSpan.FromMilliseconds(260);
 
@@ -73,6 +108,10 @@ public sealed class InkCanvasControl : Control
     // Amber underlay for provenance-highlighted strokes.
     private static readonly IImmutableSolidColorBrush GlowBrush = new ImmutableSolidColorBrush(Color.FromArgb(0x55, 0xF5, 0x9E, 0x0B));
     private static readonly IImmutableSolidColorBrush RippleBrush = new ImmutableSolidColorBrush(Color.FromArgb(0x66, 0x38, 0xB2, 0xAC));
+
+    // 5.3 A1: the dragged answer's ghost — ink, dimmed to ~40% so it reads as a copy in flight over the page.
+    private static readonly IImmutableSolidColorBrush GhostBrush = new ImmutableSolidColorBrush(Color.FromArgb(0x66, 0x18, 0x20, 0x2A));
+    private static readonly IImmutableSolidColorBrush MutedInkBrush = new ImmutableSolidColorBrush(Color.FromArgb(0x44, 0x18, 0x20, 0x2A));
 
     private readonly Stopwatch _clock = Stopwatch.StartNew();
     private readonly StrokeWidthModel _widthModel = new();
@@ -106,6 +145,29 @@ public sealed class InkCanvasControl : Control
     private bool _isPanning;
     private double _lastPanX;
     private double _lastPanY;
+
+    // 5.3 A1 hold-to-grab / drag state — the fourth peer alongside panning, erasing, and _activeSamples.
+    // A press on an answer arms _grabCandidate (while _activeSamples still accumulates, so a quick release
+    // is an ordinary tap/dot); _grabTimer converts it if the pointer holds still; conversion discards the
+    // active ink and enters the drag state below. All coordinates recorded here are in WORLD units.
+    private HoldToGrabDetector? _grabCandidate;
+    private DispatcherTimer? _grabTimer;
+    private Guid _grabOwnerId;
+    private GrabTargetKind _grabTargetKind;
+    private LiteralRun? _grabLiteralRun;
+    private IPointer? _grabPointer;
+    private double _grabPressWorldX;
+    private double _grabPressWorldY;
+    private double _grabPressScreenX;
+    private double _lastGrabScreenX;
+    private double _lastGrabScreenY;
+
+    private bool _isDragging;
+    private Guid _dragOwnerId;
+    private double _dragDeltaX;
+    private double _dragDeltaY;
+
+    private bool _isTaffying;
 
     public InkCanvasControl()
     {
@@ -152,6 +214,20 @@ public sealed class InkCanvasControl : Control
         set => SetValue(ProvenanceStrokeIdsProperty, value);
     }
 
+    /// <summary>5.3: per-line grabbable numeric literals consumed by hold-to-taffy hit-testing.</summary>
+    public LiteralRunLayer? LiteralRunLayer
+    {
+        get => GetValue(LiteralRunLayerProperty);
+        set => SetValue(LiteralRunLayerProperty, value);
+    }
+
+    /// <summary>5.3 A2 static hypothetical ink and suppression state, or null outside a taffy session.</summary>
+    public TaffyGhostLayer? TaffyGhostLayer
+    {
+        get => GetValue(TaffyGhostLayerProperty);
+        set => SetValue(TaffyGhostLayerProperty, value);
+    }
+
     protected override void OnPropertyChanged(AvaloniaPropertyChangedEventArgs change)
     {
         base.OnPropertyChanged(change);
@@ -184,6 +260,18 @@ public sealed class InkCanvasControl : Control
         }
         else if (change.Property == ProvenanceStrokeIdsProperty)
         {
+            InvalidateVisual();
+        }
+        else if (change.Property == TaffyGhostLayerProperty)
+        {
+            // A null published by the VM force-ends a gesture invalidated by a document edit/load/reset.
+            if (change.NewValue is null && _isTaffying)
+            {
+                _isTaffying = false;
+                _grabPointer?.Capture(null);
+                _grabPointer = null;
+            }
+
             InvalidateVisual();
         }
     }
@@ -339,6 +427,10 @@ public sealed class InkCanvasControl : Control
         StopAnswerTimer();   // don't leave timers running against a detached control.
         StopGlitchTimer();
         StopRippleTimer();
+        StopGrabTimer();
+        _grabPointer?.Capture(null);
+        _grabPointer = null;
+        _isTaffying = false;
     }
 
     // --- Rendering -------------------------------------------------------------------------------
@@ -358,6 +450,7 @@ public sealed class InkCanvasControl : Control
             {
                 IReadOnlySet<Guid>? uncertain = UncertainStrokeIds;
                 IReadOnlySet<Guid>? provenance = ProvenanceStrokeIds;
+                IReadOnlySet<Guid>? muted = TaffyGhostLayer?.MutedStrokeIds;
 
                 // 4.5d: glow underlay pass first, so no highlighted stroke's glow sits on a neighbour's ink.
                 if (provenance is { Count: > 0 })
@@ -392,7 +485,11 @@ public sealed class InkCanvasControl : Control
                 {
                     // Strokes are stored raw; draw the smoothed form (cached per id).
                     Stroke smoothed = _smoothCache.GetSmoothed(stroke);
-                    if (uncertain is not null && uncertain.Contains(stroke.Id))
+                    if (muted is not null && muted.Contains(stroke.Id))
+                    {
+                        DrawStroke(context, smoothed, MutedInkBrush, widthPad: 0);
+                    }
+                    else if (uncertain is not null && uncertain.Contains(stroke.Id))
                     {
                         DrawGlitchStroke(context, smoothed);   // 4.5c: the reject, made visible in-place
                     }
@@ -415,11 +512,45 @@ public sealed class InkCanvasControl : Control
             // The answer layer: replay the timeline up to the current instant, on top of the document ink and
             // in the SAME world transform (the synthesizer anchored these strokes at the '=' world bounds).
             // Reusing DrawStroke gives the answer the identical pressure/velocity width model as real ink.
+            IReadOnlySet<Guid>? hiddenAnswers = TaffyGhostLayer?.HiddenAnswerOwnerIds;
             foreach (AnswerPlayback answer in _answers.Values.OrderBy(entry => entry.Animation.Sequence))
             {
+                if (hiddenAnswers is not null && hiddenAnswers.Contains(answer.Animation.OwnerId))
+                {
+                    continue;
+                }
+
                 foreach (Stroke stroke in answer.Animation.Handwriting.Timeline.SampleAt(AnswerElapsed(answer)))
                 {
                     DrawStroke(context, stroke);
+                }
+            }
+
+            // 5.3 A2: hypothetical literal and dependent-answer values are final-frame static ghosts. The
+            // grabbed literal alone receives a small screen-space lift; no timeline or synthesis runs here.
+            foreach (TaffyGhost ghost in TaffyGhostLayer?.Ghosts ?? Array.Empty<TaffyGhost>())
+            {
+                using (context.PushTransform(Matrix.CreateTranslation(0, -ghost.LiftScreenPx / _scale)))
+                {
+                    foreach (Stroke stroke in ghost.Handwriting.Strokes)
+                    {
+                        DrawStroke(context, stroke, GhostBrush, widthPad: 0);
+                    }
+                }
+            }
+
+            // 5.3 A1: while an answer is being dragged, its original stays put (drawn above) and a dimmed
+            // ghost copy follows the pointer — translated by the world drag delta and lifted a touch so the
+            // grab reads as "picked up". Uses the already-synthesized final strokes; nothing is re-synthesized.
+            if (_isDragging && _answers.TryGetValue(_dragOwnerId, out AnswerPlayback? dragged))
+            {
+                double lift = GrabLiftScreenPx / _scale;
+                using (context.PushTransform(Matrix.CreateTranslation(_dragDeltaX, _dragDeltaY - lift)))
+                {
+                    foreach (Stroke stroke in dragged.Animation.Handwriting.Strokes)
+                    {
+                        DrawStroke(context, stroke, GhostBrush, widthPad: 0);
+                    }
                 }
             }
         }
@@ -531,19 +662,175 @@ public sealed class InkCanvasControl : Control
             {
                 _activeSamples = new List<StrokeSample>();
                 AddSample(point);
+                ArmGrabCandidate(point, e.Pointer);
             }
             e.Pointer.Capture(this);
             e.Handled = true;
 
-            // 4.5b: any pending/in-flight live read no longer describes the page being drawn on.
+            // 4.5b: any pending/in-flight live read no longer describes the page being drawn on. This holds
+            // even for a press that becomes a grab: a live read is stale the moment the pointer lands.
             DrawingStarted?.Invoke(this, EventArgs.Empty);
         }
+    }
+
+    // 5.3: a left-button press on an answer (first) or literal box arms a hold-to-grab candidate. The active ink
+    // stroke keeps accumulating in parallel — a quick release stays an ordinary tap/dot; only a held press
+    // converts. A short one-shot timer performs the time-based conversion even if the pointer never moves.
+    private void ArmGrabCandidate(PointerPoint point, IPointer pointer)
+    {
+        double worldX = (point.Position.X - _offsetX) / _scale;
+        double worldY = (point.Position.Y - _offsetY) / _scale;
+        Guid ownerId;
+        if (AnswerOwnerAt(worldX, worldY) is Guid answerOwnerId)
+        {
+            ownerId = answerOwnerId;
+            _grabTargetKind = GrabTargetKind.Answer;
+            _grabLiteralRun = null;
+        }
+        else if (LiteralRunAt(worldX, worldY) is { } literal)
+        {
+            ownerId = literal.OwnerId;
+            _grabTargetKind = GrabTargetKind.Literal;
+            _grabLiteralRun = literal.Run;
+        }
+        else
+        {
+            return;
+        }
+
+        _grabOwnerId = ownerId;
+        _grabPointer = pointer;
+        _grabPressWorldX = worldX;
+        _grabPressWorldY = worldY;
+        _grabPressScreenX = point.Position.X;
+        _lastGrabScreenX = point.Position.X;
+        _lastGrabScreenY = point.Position.Y;
+        _grabCandidate = new HoldToGrabDetector(point.Position.X, point.Position.Y, GrabSlopScreenPx, GrabHoldDuration);
+
+        _grabTimer = new DispatcherTimer { Interval = GrabHoldDuration };
+        _grabTimer.Tick += OnGrabTick;
+        _grabTimer.Start();
+    }
+
+    private void OnGrabTick(object? sender, EventArgs e)
+    {
+        if (_grabCandidate is null)
+        {
+            StopGrabTimer();
+            return;
+        }
+
+        HoldToGrabDetector.GrabState state = _grabCandidate.Update(
+            _lastGrabScreenX, _lastGrabScreenY, _clock.Elapsed - _strokeStart);
+        if (state == HoldToGrabDetector.GrabState.Converted)
+        {
+            BeginGrab();
+        }
+        else if (state == HoldToGrabDetector.GrabState.Disarmed)
+        {
+            ClearGrabCandidate();
+        }
+        else
+        {
+            // Still within slop but the hold has not registered yet (timer jitter) — check again next tick.
+            return;
+        }
+    }
+
+    // Converts an armed candidate into answer drag or taffy; both discard the uncommitted active ink.
+    private void BeginGrab()
+    {
+        if (_grabTargetKind == GrabTargetKind.Literal)
+        {
+            BeginTaffy();
+        }
+        else
+        {
+            BeginDrag();
+        }
+    }
+
+    private void BeginDrag()
+    {
+        StopGrabTimer();
+        _grabCandidate = null;
+        _activeSamples = null;
+        _isDragging = true;
+        _dragOwnerId = _grabOwnerId;
+        _dragDeltaX = 0;
+        _dragDeltaY = 0;
+        InvalidateVisual();
+    }
+
+    private void BeginTaffy()
+    {
+        StopGrabTimer();
+        _grabCandidate = null;
+        _activeSamples = null;
+
+        if (_grabLiteralRun is not { } run)
+        {
+            _grabPointer?.Capture(null);
+            _grabPointer = null;
+            AnswerDragCancelled?.Invoke(this, EventArgs.Empty);
+            return;
+        }
+
+        var args = new TaffyStartedEventArgs(_grabOwnerId, run);
+        TaffyStarted?.Invoke(this, args);
+        if (!args.Accepted)
+        {
+            _grabPointer?.Capture(null);
+            _grabPointer = null;
+            AnswerDragCancelled?.Invoke(this, EventArgs.Empty);
+            return;
+        }
+
+        _isTaffying = true;
+        InvalidateVisual();
+    }
+
+    private void StopGrabTimer()
+    {
+        if (_grabTimer is null)
+        {
+            return;
+        }
+
+        _grabTimer.Stop();
+        _grabTimer.Tick -= OnGrabTick;
+        _grabTimer = null;
+    }
+
+    private void ClearGrabCandidate()
+    {
+        StopGrabTimer();
+        _grabCandidate = null;
+        _grabLiteralRun = null;
     }
 
     protected override void OnPointerMoved(PointerEventArgs e)
     {
         base.OnPointerMoved(e);
         PointerPoint point = e.GetCurrentPoint(this);
+
+        if (_isTaffying)
+        {
+            TaffyMoved?.Invoke(this, new TaffyMovedEventArgs(point.Position.X - _grabPressScreenX));
+            return;
+        }
+
+        // 5.3 A1: a live drag owns the move — the ghost follows the pointer by the world drag delta and no
+        // document ink is touched.
+        if (_isDragging)
+        {
+            double dragX = (point.Position.X - _offsetX) / _scale;
+            double dragY = (point.Position.Y - _offsetY) / _scale;
+            _dragDeltaX = dragX - _grabPressWorldX;
+            _dragDeltaY = dragY - _grabPressWorldY;
+            InvalidateVisual();
+            return;
+        }
 
         if (_isPanning)
         {
@@ -563,6 +850,26 @@ public sealed class InkCanvasControl : Control
         }
         else if (_activeSamples is not null)
         {
+            // 5.3 A1: while a grab candidate is armed, feed it this move. A slop breach disarms it (pure ink
+            // from here); holding within slop long enough converts to a drag and abandons the active ink.
+            if (_grabCandidate is not null)
+            {
+                _lastGrabScreenX = point.Position.X;
+                _lastGrabScreenY = point.Position.Y;
+                HoldToGrabDetector.GrabState state = _grabCandidate.Update(
+                    point.Position.X, point.Position.Y, _clock.Elapsed - _strokeStart);
+                if (state == HoldToGrabDetector.GrabState.Converted)
+                {
+                    BeginGrab();
+                    return;
+                }
+
+                if (state == HoldToGrabDetector.GrabState.Disarmed)
+                {
+                    ClearGrabCandidate();
+                }
+            }
+
             // Intermediate points recover the high-frequency samples coalesced into one move event.
             foreach (PointerPoint intermediate in e.GetIntermediatePoints(this))
             {
@@ -577,10 +884,30 @@ public sealed class InkCanvasControl : Control
     {
         base.OnPointerReleased(e);
 
+        if (_isTaffying)
+        {
+            EndTaffyGesture(e.Pointer);
+            return;
+        }
+
+        // 5.3 A1: releasing a live drag stamps the answer as ink (or cancels within the start slop). The
+        // original answer is never touched here — only the drop turns it into document ink, via the VM.
+        if (_isDragging)
+        {
+            EndDrag(e);
+            return;
+        }
+
+        // A press that armed a grab but released before converting (a quick tap on the answer, or a short
+        // ordinary stroke) falls through to today's ladder verbatim — tear the candidate down first so
+        // tap-for-provenance and dot-drawing behave exactly as before.
+        ClearGrabCandidate();
+
         if (_isPanning)
         {
             _isPanning = false;
             e.Pointer.Capture(null);
+            _grabPointer = null;
             return;
         }
 
@@ -589,6 +916,7 @@ public sealed class InkCanvasControl : Control
             HashSet<Guid> hits = _eraseHits;
             _eraseHits = null;
             e.Pointer.Capture(null);
+            _grabPointer = null;
             // One pointer gesture is one document edit and therefore one undo step. Hit testing only ever
             // receives display-smoothed document strokes; synthesized answer ink is not addressable here.
             Document?.EraseStrokes(hits);
@@ -599,6 +927,7 @@ public sealed class InkCanvasControl : Control
             List<StrokeSample> samples = _activeSamples;
             _activeSamples = null;
             e.Pointer.Capture(null);
+            _grabPointer = null;
 
             if (samples.Count > 0)
             {
@@ -618,6 +947,72 @@ public sealed class InkCanvasControl : Control
 
             InvalidateVisual();
         }
+    }
+
+    // Resolves a completed drag: computes the world drag delta and drop point, releases capture, and either
+    // raises AnswerDragCompleted (a real drop, to be stamped) or AnswerDragCancelled (a drop back within the
+    // start slop — nothing stamped, but the VM must re-signal the recognition the grab's pen-down cancelled).
+    private void EndDrag(PointerReleasedEventArgs e)
+    {
+        PointerPoint point = e.GetCurrentPoint(this);
+        double dropX = (point.Position.X - _offsetX) / _scale;
+        double dropY = (point.Position.Y - _offsetY) / _scale;
+        double dx = dropX - _grabPressWorldX;
+        double dy = dropY - _grabPressWorldY;
+        Guid owner = _dragOwnerId;
+
+        _isDragging = false;
+        e.Pointer.Capture(null);
+        _grabPointer = null;
+        InvalidateVisual();
+
+        double slopWorld = GrabSlopScreenPx / _scale;
+        if (dx * dx + dy * dy <= slopWorld * slopWorld)
+        {
+            AnswerDragCancelled?.Invoke(this, EventArgs.Empty);
+            return;
+        }
+
+        AnswerDragCompleted?.Invoke(this, new AnswerDragCompletedEventArgs(owner, dx, dy, dropX, dropY));
+    }
+
+    // Escape abandons an in-flight drag: the answer stays put, nothing is stamped, and (like a slop cancel)
+    // the VM re-signals its eaten recognition.
+    private void CancelActiveDrag()
+    {
+        if (!_isDragging)
+        {
+            return;
+        }
+
+        _isDragging = false;
+        _grabPointer?.Capture(null);
+        _grabPointer = null;
+        InvalidateVisual();
+        AnswerDragCancelled?.Invoke(this, EventArgs.Empty);
+    }
+
+    private void EndTaffyGesture(IPointer pointer)
+    {
+        _isTaffying = false;
+        pointer.Capture(null);
+        _grabPointer = null;
+        InvalidateVisual();
+        TaffyEnded?.Invoke(this, EventArgs.Empty);
+    }
+
+    private void CancelActiveTaffy()
+    {
+        if (!_isTaffying)
+        {
+            return;
+        }
+
+        _isTaffying = false;
+        _grabPointer?.Capture(null);
+        _grabPointer = null;
+        InvalidateVisual();
+        TaffyEnded?.Invoke(this, EventArgs.Empty);
     }
 
     // A tap: every sample stays within the slop of the first (screen-space, so zoom-invariant), and the
@@ -641,15 +1036,60 @@ public sealed class InkCanvasControl : Control
             }
         }
 
-        // Latest sequence is visually topmost and therefore owns an overlap tap.
+        return AnswerOwnerAt(first.X, first.Y);
+    }
+
+    // Topmost answer (latest sequence) whose ink lies within tolerance of the world point, or null. Shared
+    // by the provenance tap and the 5.3 hold-to-grab arming so both resolve the same owner the same way.
+    private Guid? AnswerOwnerAt(double worldX, double worldY)
+    {
+        if (_answers.Count == 0)
+        {
+            return null;
+        }
+
         return _answers.Values
             .OrderByDescending(answer => answer.Animation.Sequence)
             .FirstOrDefault(answer => AnswerHitTester.HitTest(
                 answer.Animation.Handwriting.Strokes,
-                first.X,
-                first.Y,
+                worldX,
+                worldY,
                 TapToleranceScreenPx / _scale))
             ?.Animation.OwnerId;
+    }
+
+    // Answers deliberately win before this method is considered. Literal hit-testing uses the recognized
+    // union box padded by the same 12 screen pixels as answer taps; all source strokes must still exist.
+    private LiteralGrabTarget? LiteralRunAt(double worldX, double worldY)
+    {
+        LiteralRunLayer? layer = LiteralRunLayer;
+        InkDocument? document = Document;
+        if (layer is null || document is null)
+        {
+            return null;
+        }
+
+        HashSet<Guid> present = document.Strokes.Select(stroke => stroke.Id).ToHashSet();
+        double pad = TapToleranceScreenPx / _scale;
+        for (int ownerIndex = layer.Owners.Count - 1; ownerIndex >= 0; ownerIndex--)
+        {
+            LiteralRunOwner owner = layer.Owners[ownerIndex];
+            for (int runIndex = owner.Runs.Count - 1; runIndex >= 0; runIndex--)
+            {
+                LiteralRun run = owner.Runs[runIndex];
+                InkBounds bounds = run.UnionBounds;
+                bool inside = worldX >= bounds.X - pad
+                    && worldX <= bounds.X + bounds.Width + pad
+                    && worldY >= bounds.Y - pad
+                    && worldY <= bounds.Y + bounds.Height + pad;
+                if (inside && run.SourceStrokeIds.Count > 0 && run.SourceStrokeIds.All(present.Contains))
+                {
+                    return new LiteralGrabTarget(owner.OwnerId, run);
+                }
+            }
+        }
+
+        return null;
     }
 
     // Pixels of pan per unit of wheel/scroll delta. Tuned so one mouse notch nudges the canvas a
@@ -690,6 +1130,19 @@ public sealed class InkCanvasControl : Control
         e.Handled = true;
     }
 
+    protected override void OnKeyDown(KeyEventArgs e)
+    {
+        base.OnKeyDown(e);
+
+        // Escape abandons either held interaction. Left to bubble to the window otherwise.
+        if (e.Key == Key.Escape && (_isDragging || _isTaffying))
+        {
+            if (_isTaffying) CancelActiveTaffy();
+            else CancelActiveDrag();
+            e.Handled = true;
+        }
+    }
+
     private void AddSample(PointerPoint point)
     {
         double worldX = (point.Position.X - _offsetX) / _scale;
@@ -712,4 +1165,6 @@ public sealed class InkCanvasControl : Control
     }
 
     private sealed record AnswerPlayback(AnswerAnimation Animation, TimeSpan Start);
+    private sealed record LiteralGrabTarget(Guid OwnerId, LiteralRun Run);
+    private enum GrabTargetKind { Answer, Literal }
 }

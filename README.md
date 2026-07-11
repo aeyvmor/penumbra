@@ -10,9 +10,9 @@ no cloud, no account, everything on your device.
 
 ## Download
 
-**Latest release:** `v0.0.2` for Windows x64.
+**Latest release:** `v0.0.3` for Windows x64.
 
-Download `Penumbra-v0.0.2-win-x64.zip` from
+Download `Penumbra-v0.0.3-win-x64.zip` from
 [Releases](https://github.com/aeyvmor/penumbra/releases/latest), unzip it, and run
 `Penumbra.App.exe`.
 
@@ -20,19 +20,25 @@ Windows may warn because this early build is not signed yet.
 
 ## What Works Today
 
-Penumbra is in active early development. Expect rough edges.
+Penumbra is in active early development. The latest packaged release is v0.0.3; public `main` may
+contain newer milestone work before it receives a release tag. Expect rough edges.
 
 - Write a single-line expression ending in `=` (for example `2+2=`, `21+7=`, `4+1-9=`) — lift the
   pen, and a beat later the answer writes itself from the `=` in animated handwriting. No button.
 - Symbols Penumbra isn't sure about desaturate and shiver; when it can't read a line at all, it
   says so instead of guessing (the recognizer is confidence-calibrated and refuses non-math ink).
 - Tap an answer to highlight the exact strokes it came from.
+- Put definitions and queries on separate lines (`x=5`, `y=x+2`, `y+1=`): changing one value
+  re-solves downstream answers and shows the dependency ripple.
+- Erase individual strokes, undo/redo one gesture at a time, and save/reopen `.pen` v3 pages.
+- Hold an answer to drag and stamp it elsewhere as ordinary ink. Hold a numeric literal and drag
+  horizontally to preview dependent values as reversible "taffy" ghost ink.
 - Penumbra passively learns your digits/operators as you use it; missing symbols fall back to the
   bundled Caveat handwriting font.
 - Everything runs offline on your machine.
 
-Recognition works best with clearly separated symbols. Fractions, radicals, superscripts, brackets,
-graphing, the reactive sheet, and the tutor are future work.
+Recognition works best with clearly separated symbols and one expression per horizontal line.
+Fractions, radicals, superscripts, brackets, graphing, and the tutor remain future work.
 
 ## Building
 

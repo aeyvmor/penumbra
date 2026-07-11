@@ -29,6 +29,26 @@ public sealed class InkDocument
         Apply(new AddStrokeEdit(stroke));
     }
 
+    /// <summary>
+    /// Appends a batch of strokes, in the given order, as a single undoable edit — the whole batch
+    /// undoes/redoes as one step (a multi-stroke insertion like a re-inked taffy literal must vanish
+    /// with one undo), mirroring the batch contract of <see cref="EraseStrokes"/>. An empty batch is
+    /// a harmless no-op that records no history and raises no event; otherwise exactly one
+    /// <see cref="Changed"/> fires per call and, like any fresh edit, the redo branch is discarded.
+    /// </summary>
+    public void AddStrokes(IEnumerable<Stroke> strokes)
+    {
+        ArgumentNullException.ThrowIfNull(strokes);
+
+        var batch = strokes.ToList();
+        if (batch.Count == 0)
+        {
+            return;
+        }
+
+        Apply(new AddStrokesEdit(batch));
+    }
+
     /// <summary>Removes every stroke as a single undoable edit. No-op (and no history entry) when empty.</summary>
     public void Clear()
     {
@@ -75,6 +95,39 @@ public sealed class InkDocument
         }
 
         Apply(new EraseStrokesEdit(removals));
+    }
+
+    /// <summary>
+    /// Atomically removes every current stroke whose id appears in <paramref name="removedIds"/> and
+    /// appends <paramref name="addedStrokes"/> in order as one undoable edit. This is the literal-drop
+    /// contract: replacing a handwritten value must not leave the old ink underneath or require two undo
+    /// steps. Duplicate document ids are all removed; unknown ids are ignored. When no stroke matches and
+    /// the addition is empty, the call is a no-op with no history/event. Otherwise exactly one
+    /// <see cref="Changed"/> event fires, undo restores the removed strokes at their exact original indices
+    /// and removes the addition, and redo reapplies the same replacement.
+    /// </summary>
+    public void ReplaceStrokes(IEnumerable<Guid> removedIds, IEnumerable<Stroke> addedStrokes)
+    {
+        ArgumentNullException.ThrowIfNull(removedIds);
+        ArgumentNullException.ThrowIfNull(addedStrokes);
+
+        HashSet<Guid> requested = removedIds.ToHashSet();
+        var removals = new List<(int Index, Stroke Stroke)>();
+        for (int index = 0; index < _strokes.Count; index++)
+        {
+            if (requested.Contains(_strokes[index].Id))
+            {
+                removals.Add((index, _strokes[index]));
+            }
+        }
+
+        var additions = addedStrokes.ToList();
+        if (removals.Count == 0 && additions.Count == 0)
+        {
+            return;
+        }
+
+        Apply(new ReplaceStrokesEdit(removals, additions));
     }
 
     /// <summary>Reverts the most recent edit, if any.</summary>
@@ -146,6 +199,21 @@ public sealed class InkDocument
         public void Revert(List<Stroke> strokes) => strokes.Remove(_stroke);
     }
 
+    private sealed class AddStrokesEdit : IInkEdit
+    {
+        private readonly IReadOnlyList<Stroke> _added;
+
+        public AddStrokesEdit(IReadOnlyList<Stroke> added) => _added = added;
+
+        public void Apply(List<Stroke> strokes) => strokes.AddRange(_added);
+
+        // Undo runs strictly LIFO (the same guarantee ClearEdit's Revert leans on), so when Revert
+        // fires the batch still sits at the tail exactly where Apply appended it — cut that tail
+        // range in one O(batch) removal instead of value-equality scans per stroke.
+        public void Revert(List<Stroke> strokes) =>
+            strokes.RemoveRange(strokes.Count - _added.Count, _added.Count);
+    }
+
     private sealed class ClearEdit : IInkEdit
     {
         private readonly IReadOnlyList<Stroke> _removed;
@@ -178,6 +246,44 @@ public sealed class InkDocument
         {
             // Ascending order keeps each captured index valid: lower slots are refilled before we reach the
             // higher ones, so every stroke lands back where it started.
+            foreach ((int index, Stroke stroke) in _removed)
+            {
+                strokes.Insert(index, stroke);
+            }
+        }
+    }
+
+    private sealed class ReplaceStrokesEdit : IInkEdit
+    {
+        private readonly IReadOnlyList<(int Index, Stroke Stroke)> _removed;
+        private readonly IReadOnlyList<Stroke> _added;
+
+        public ReplaceStrokesEdit(
+            IEnumerable<(int Index, Stroke Stroke)> removed,
+            IReadOnlyList<Stroke> added)
+        {
+            _removed = removed.OrderBy(item => item.Index).ToList();
+            _added = added;
+        }
+
+        public void Apply(List<Stroke> strokes)
+        {
+            foreach ((_, Stroke stroke) in _removed)
+            {
+                strokes.Remove(stroke);
+            }
+
+            strokes.AddRange(_added);
+        }
+
+        public void Revert(List<Stroke> strokes)
+        {
+            // Replacement additions are always the tail at LIFO undo time, exactly like AddStrokesEdit.
+            if (_added.Count > 0)
+            {
+                strokes.RemoveRange(strokes.Count - _added.Count, _added.Count);
+            }
+
             foreach ((int index, Stroke stroke) in _removed)
             {
                 strokes.Insert(index, stroke);

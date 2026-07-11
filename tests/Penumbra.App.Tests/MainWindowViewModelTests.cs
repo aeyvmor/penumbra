@@ -1,4 +1,6 @@
+using Avalonia.Threading;
 using Microsoft.Extensions.DependencyInjection;
+using Penumbra.App;
 using Penumbra.App.Services;
 using Penumbra.App.ViewModels;
 using Penumbra.Cas;
@@ -281,12 +283,381 @@ public sealed class MainWindowViewModelTests
         second.Dispose();
     }
 
-    private static MainWindowViewModel Create(IRegionRecognizer recognizer, IGlyphBank? bank = null) => new(
+    // --- 5.3 A1: hold-to-grab stamp-as-ink, banking exclusion, drag-cancel re-signal ------------------
+
+    [Fact]
+    public async Task StampAnswerAddsOneUndoableBatchWithFreshIds()
+    {
+        var query = Region("2+2=", y: 0);
+        using MainWindowViewModel vm = Create(new QueueRecognizer(new[] { query }));
+        AddInk(vm, query);
+        await vm.RecognizeNowAsync();
+
+        AnswerAnimation answer = vm.AnswerLayer.Answers.Single();
+        IReadOnlyList<Stroke> answerStrokes = answer.Handwriting.Strokes;
+        int answerCount = answerStrokes.Count;
+        Assert.True(answerCount > 0);
+        HashSet<Guid> answerIds = answerStrokes.Select(stroke => stroke.Id).ToHashSet();
+        HashSet<Guid> before = vm.Document.Strokes.Select(stroke => stroke.Id).ToHashSet();
+
+        vm.StampAnswer(answer.OwnerId, dx: 40, dy: 120, dropX: 40, dropY: 300);
+
+        // The document gained exactly the answer's strokes...
+        Assert.Equal(before.Count + answerCount, vm.Document.Strokes.Count);
+        Guid[] stamped = vm.Document.Strokes.Select(stroke => stroke.Id).Where(id => !before.Contains(id)).ToArray();
+        Assert.Equal(answerCount, stamped.Length);
+        // ...with fresh ids, disjoint from the answer's own (an id reuse would corrupt Seam-1 alignment)...
+        Assert.All(stamped, id => Assert.DoesNotContain(id, answerIds));
+        // ...and the whole batch is a single undo step.
+        vm.Document.Undo();
+        Assert.Equal(before.Count, vm.Document.Strokes.Count);
+    }
+
+    [Fact]
+    public async Task StampedStrokesAreNeverBanked()
+    {
+        var query = Region("2+2=", y: 0);
+        var bank = new RecordingBank();
+        var recognizer = new FuncRecognizer { Next = _ => new[] { query } };
+        using MainWindowViewModel vm = Create(recognizer, bank);
+        AddInk(vm, query);
+        await vm.RecognizeNowAsync();
+
+        Guid ownerId = vm.AnswerLayer.Answers.Single().OwnerId;
+        HashSet<Guid> beforeStamp = vm.Document.Strokes.Select(stroke => stroke.Id).ToHashSet();
+        vm.StampAnswer(ownerId, dx: 0, dy: 0, dropX: 0, dropY: 0);
+        Guid[] stampedIds = vm.Document.Strokes.Select(stroke => stroke.Id).Where(id => !beforeStamp.Contains(id)).ToArray();
+        Assert.NotEmpty(stampedIds);
+
+        // A fresh, hand-drawn digit stroke stands as the positive control — real ink banking must still work.
+        var digitStroke = new Stroke(Guid.NewGuid(), new[] { new StrokeSample(30, 10, TimeSpan.Zero, .5) });
+        vm.Document.AddStroke(digitStroke);
+
+        // A later completed query whose "4" is backed by the STAMPED stroke and whose "1" is backed by the
+        // fresh real ink. Banking must take the real digit and skip the stamped one (D10).
+        Guid originalId = query.Region.StrokeIds[0];
+        var stampedToken = new RecognizedToken("4", new[] { stampedIds[0] }, new InkBounds(0, 0, 20, 30), .99);
+        var realToken = new RecognizedToken("1", new[] { digitStroke.Id }, new InkBounds(30, 0, 20, 30), .99);
+        var eqToken = new RecognizedToken("=", new[] { originalId }, new InkBounds(60, 0, 20, 30), .99);
+        var completed = new RegionRecognition(
+            new InkRegion(query.Region.Id, new[] { originalId, digitStroke.Id, stampedIds[0] }, new InkBounds(0, 0, 80, 30), Array.Empty<StrokeGroup>()),
+            new RecognitionResult("4+1=", new[] { stampedToken, realToken, eqToken }, .99, .99),
+            Dirty: true);
+        recognizer.Next = _ => new[] { completed };
+
+        await vm.RecognizeNowAsync();
+
+        Assert.Contains(bank.Captured, sample => sample.Symbol == "1");
+        Assert.DoesNotContain(bank.Captured, sample => sample.Strokes.Any(stroke => stampedIds.Contains(stroke.Id)));
+    }
+
+    [Fact]
+    public void AnswerDragCancelReSignalsDebouncer()
+    {
+        var time = new FakeTimeProvider();
+        var recognizer = new CountingRecognizer();
+        using MainWindowViewModel vm = Create(recognizer, time: time);
+        vm.Document.AddStroke(new Stroke(Guid.NewGuid(), new[] { new StrokeSample(10, 10, TimeSpan.Zero, .5) }));
+
+        // The grab's pen-down cancelled the pending live read; a cancelled drag then mutates nothing, so on
+        // its own the eaten pass never restarts.
+        vm.NotifyStrokeStarted();
+        time.Advance(LiveQuietPeriodPlus());
+        Dispatcher.UIThread.RunJobs();
+        Assert.Equal(0, recognizer.Calls);
+
+        // The drag-cancel notification restores it.
+        vm.NotifyAnswerDragCancelled();
+        time.Advance(LiveQuietPeriodPlus());
+        Dispatcher.UIThread.RunJobs();
+
+        Assert.Equal(1, recognizer.Calls);
+    }
+
+    [Fact]
+    public async Task StampOntoLineRescalesToLineHeight()
+    {
+        var query = Region("2+2=", y: 0);
+        // A separate accepted line to drop onto, with a known glyph height (60 → clamped median 60).
+        var targetStroke = new Stroke(Guid.NewGuid(), new[]
+        {
+            new StrokeSample(10, 410, TimeSpan.Zero, .5),
+            new StrokeSample(30, 470, TimeSpan.FromMilliseconds(20), .5),
+        });
+        var targetBounds = new InkBounds(10, 400, 40, 60);
+        var targetToken = new RecognizedToken("7", new[] { targetStroke.Id }, targetBounds, .99);
+        var target = new RegionRecognition(
+            new InkRegion(Guid.NewGuid(), new[] { targetStroke.Id }, targetBounds, new[] { new StrokeGroup(new[] { targetStroke }, targetBounds) }),
+            new RecognitionResult("7", new[] { targetToken }, .99, .99),
+            Dirty: true);
+
+        using MainWindowViewModel vm = Create(new QueueRecognizer(new[] { query, target }));
+        AddInk(vm, query, target);
+        await vm.RecognizeNowAsync();
+
+        AnswerAnimation answer = vm.AnswerLayer.Answers.Single(a => a.OwnerId == query.Region.Id);
+        double sourceHeight = StrokeHeight(answer.Handwriting.Strokes);
+        double lineHeight = MainWindowViewModel.ClampedMedianTokenHeight(target.Result.Tokens);
+        Assert.True(Math.Abs(sourceHeight - lineHeight) > 1);   // a meaningful rescale, not a coincidence
+
+        // Dropped on the target line's y-band → rescaled so its glyph height matches that line's.
+        int before = vm.Document.Strokes.Count;
+        vm.StampAnswer(query.Region.Id, dx: 0, dy: 0, dropX: 80, dropY: 430);
+        Stroke[] onLine = vm.Document.Strokes.Skip(before).ToArray();
+        Assert.Equal(lineHeight, StrokeHeight(onLine), 3);
+
+        // Dropped into empty space → keeps the answer's own size.
+        int before2 = vm.Document.Strokes.Count;
+        vm.StampAnswer(query.Region.Id, dx: 0, dy: 0, dropX: 30, dropY: 1000);
+        Stroke[] empty = vm.Document.Strokes.Skip(before2).ToArray();
+        Assert.Equal(sourceHeight, StrokeHeight(empty), 3);
+    }
+
+    // --- 5.3 A2: taffy probe loop ---------------------------------------------------------------
+
+    [Fact]
+    public async Task TaffyProbeShowsLiteralAndDependentGhostsWithoutMutatingCommittedState()
+    {
+        var definition = ExpressionRegion("x=5", 0, "x", "=", "5");
+        var query = ExpressionRegion("x+1=", 80, "x", "+", "1", "=");
+        using MainWindowViewModel vm = Create(new QueueRecognizer(new[] { definition, query }));
+        AddInk(vm, definition, query);
+        await vm.RecognizeNowAsync();
+
+        LiteralRun run = vm.LiteralRunLayer.Owners
+            .Single(owner => owner.OwnerId == definition.Region.Id)
+            .Runs.Single(candidate => candidate.ValueText == "5");
+        Stroke[] documentBefore = vm.Document.Strokes.ToArray();
+        EvaluationResult? definitionBefore = vm.SheetNodes.Single(n => n.Id == definition.Region.Id).Result;
+        EvaluationResult? queryBefore = vm.SheetNodes.Single(n => n.Id == query.Region.Id).Result;
+        AnswerLayer answersBefore = vm.AnswerLayer;
+
+        Assert.True(vm.BeginTaffy(definition.Region.Id, run));
+        vm.UpdateTaffy(screenDx: 28); // 5 + two 14 px steps = 7; dependent query becomes 8.
+
+        TaffyGhostLayer layer = Assert.IsType<TaffyGhostLayer>(vm.TaffyGhostLayer);
+        Assert.Equal("7", layer.Ghosts.Single(ghost => ghost.IsLiteral).ValueText);
+        Assert.Equal("8", layer.Ghosts.Single(ghost => !ghost.IsLiteral && ghost.OwnerId == query.Region.Id).ValueText);
+        Assert.True(run.SourceStrokeIds.All(layer.MutedStrokeIds.Contains));
+        Assert.Contains(query.Region.Id, layer.HiddenAnswerOwnerIds);
+        Assert.Same(answersBefore, vm.AnswerLayer);
+        Assert.Equal(documentBefore, vm.Document.Strokes);
+        Assert.Equal(definitionBefore, vm.SheetNodes.Single(n => n.Id == definition.Region.Id).Result);
+        Assert.Equal(queryBefore, vm.SheetNodes.Single(n => n.Id == query.Region.Id).Result);
+        Assert.Equal(1, vm.TaffyProbeCount);
+    }
+
+    [Fact]
+    public async Task TaffyUsesCumulativeDxAndSkipsUnchangedOrRateLimitedValues()
+    {
+        var time = new FakeTimeProvider();
+        var definition = ExpressionRegion("x=5", 0, "x", "=", "5");
+        using MainWindowViewModel vm = Create(new QueueRecognizer(new[] { definition }), time: time);
+        AddInk(vm, definition);
+        await vm.RecognizeNowAsync();
+        LiteralRun run = vm.LiteralRunLayer.Owners.Single().Runs.Single(candidate => candidate.ValueText == "5");
+
+        Assert.True(vm.BeginTaffy(definition.Region.Id, run));
+        vm.UpdateTaffy(screenDx: 13); // Not one complete step.
+        Assert.Equal(0, vm.TaffyProbeCount);
+
+        vm.UpdateTaffy(screenDx: 28); // Original 5 -> 7.
+        Assert.Equal(1, vm.TaffyProbeCount);
+        Assert.Equal("7", vm.TaffyGhostLayer!.Ghosts.Single(ghost => ghost.IsLiteral).ValueText);
+
+        vm.UpdateTaffy(screenDx: 14); // Would be original 5 -> 6, but the 33 ms floor suppresses it.
+        Assert.Equal(1, vm.TaffyProbeCount);
+
+        time.Advance(MainWindowViewModel.TaffyProbeFloor + TimeSpan.FromMilliseconds(1));
+        vm.UpdateTaffy(screenDx: 14);
+
+        Assert.Equal(2, vm.TaffyProbeCount);
+        Assert.Equal("6", vm.TaffyGhostLayer!.Ghosts.Single(ghost => ghost.IsLiteral).ValueText);
+    }
+
+    [Fact]
+    public async Task TaffyReusesDeterministicGhostGeometryWhenAValueRepeats()
+    {
+        var time = new FakeTimeProvider();
+        var definition = ExpressionRegion("x=5", 0, "x", "=", "5");
+        using MainWindowViewModel vm = Create(new QueueRecognizer(new[] { definition }), time: time);
+        AddInk(vm, definition);
+        await vm.RecognizeNowAsync();
+        LiteralRun run = vm.LiteralRunLayer.Owners.Single().Runs.Single(candidate => candidate.ValueText == "5");
+
+        Assert.True(vm.BeginTaffy(definition.Region.Id, run));
+        vm.UpdateTaffy(screenDx: 28);
+        SynthesizedHandwriting first = vm.TaffyGhostLayer!.Ghosts.Single(ghost => ghost.IsLiteral).Handwriting;
+
+        time.Advance(MainWindowViewModel.TaffyProbeFloor + TimeSpan.FromMilliseconds(1));
+        vm.UpdateTaffy(screenDx: 14);
+        time.Advance(MainWindowViewModel.TaffyProbeFloor + TimeSpan.FromMilliseconds(1));
+        vm.UpdateTaffy(screenDx: 28);
+
+        SynthesizedHandwriting repeated = vm.TaffyGhostLayer!.Ghosts.Single(ghost => ghost.IsLiteral).Handwriting;
+        Assert.Same(first, repeated);
+    }
+
+    [Fact]
+    public async Task EndingTaffyRestoresPresentationAndPreservesRecognitionRoundTripState()
+    {
+        var time = new FakeTimeProvider();
+        var definition = ExpressionRegion("x=5", 0, "x", "=", "5");
+        var recognizer = new QueueRecognizer(new[] { definition }, new[] { definition with { Dirty = false } });
+        using MainWindowViewModel vm = Create(recognizer, time: time);
+        AddInk(vm, definition);
+        await vm.RecognizeNowAsync();
+        LiteralRun run = vm.LiteralRunLayer.Owners.Single().Runs.Single(candidate => candidate.ValueText == "5");
+        Stroke[] documentBefore = vm.Document.Strokes.ToArray();
+        bool couldUndoBefore = vm.Document.CanUndo;
+
+        Assert.True(vm.BeginTaffy(definition.Region.Id, run));
+        vm.UpdateTaffy(screenDx: 14);
+        vm.EndTaffy();
+
+        Assert.False(vm.IsTaffyActive);
+        Assert.Null(vm.TaffyGhostLayer);
+        Assert.Equal(documentBefore, vm.Document.Strokes);
+        Assert.Equal(couldUndoBefore, vm.Document.CanUndo);
+
+        await vm.RecognizeNowAsync();
+
+        Assert.Equal(2, recognizer.PreviousArguments.Count);
+        RegionRecognition previous = Assert.Single(recognizer.PreviousArguments[1]!);
+        Assert.Equal(definition.Region.Id, previous.Region.Id);
+        Assert.Equal("x=5", previous.Result.Latex);
+    }
+
+    [Fact]
+    public async Task DocumentMutationForceEndsTaffy()
+    {
+        var definition = ExpressionRegion("x=5", 0, "x", "=", "5");
+        using MainWindowViewModel vm = Create(new QueueRecognizer(new[] { definition }));
+        AddInk(vm, definition);
+        await vm.RecognizeNowAsync();
+        LiteralRun run = vm.LiteralRunLayer.Owners.Single().Runs.Single(candidate => candidate.ValueText == "5");
+
+        Assert.True(vm.BeginTaffy(definition.Region.Id, run));
+        vm.UpdateTaffy(screenDx: -84); // A negative trial exercises the parenthesized splice path.
+        Assert.Equal("-1", vm.TaffyGhostLayer!.Ghosts.Single(ghost => ghost.IsLiteral).ValueText);
+
+        vm.Document.AddStroke(new Stroke(Guid.NewGuid(), new[]
+        {
+            new StrokeSample(500, 500, TimeSpan.Zero, .5),
+        }));
+
+        Assert.False(vm.IsTaffyActive);
+        Assert.Null(vm.TaffyGhostLayer);
+        Assert.Equal("5", vm.SheetNodes.Single().Result?.DisplayText);
+    }
+
+    // --- s23 dogfood closures: identity answers and safe stamp targeting -----------------------
+
+    [Fact]
+    public async Task UnchangedSymbolicQueriesDoNotEchoThemselvesAsAnswers()
+    {
+        var bare = ExpressionRegion("y=", 0, "y", "=");
+        var unchanged = ExpressionRegion("y-2=", 80, "y", "-", "2", "=");
+        var simplified = ExpressionRegion("y+y=", 160, "y", "+", "y", "=");
+        using MainWindowViewModel vm = Create(new QueueRecognizer(new[] { bare, unchanged, simplified }));
+        AddInk(vm, bare, unchanged, simplified);
+
+        await vm.RecognizeNowAsync();
+
+        Assert.DoesNotContain(vm.AnswerLayer.Answers, answer => answer.OwnerId == bare.Region.Id);
+        Assert.DoesNotContain(vm.AnswerLayer.Answers, answer => answer.OwnerId == unchanged.Region.Id);
+        Assert.Contains(vm.AnswerLayer.Answers, answer => answer.OwnerId == simplified.Region.Id);
+    }
+
+    [Fact]
+    public async Task StampDirectlyOnLiteralAtomicallyReplacesItsSourceInk()
+    {
+        var source = ExpressionRegion("5-3=", 0, "5", "-", "3", "=");
+        var target = ExpressionRegion("y=8", 80, "y", "=", "8");
+        using MainWindowViewModel vm = Create(new QueueRecognizer(new[] { source, target }));
+        AddInk(vm, source, target);
+        await vm.RecognizeNowAsync();
+
+        AnswerAnimation answer = vm.AnswerLayer.Answers.Single(a => a.OwnerId == source.Region.Id);
+        LiteralRun targetRun = vm.LiteralRunLayer.Owners
+            .Single(owner => owner.OwnerId == target.Region.Id)
+            .Runs.Single(run => run.ValueText == "8");
+        Stroke[] before = vm.Document.Strokes.ToArray();
+        (double answerX, double answerY) = StrokeCenter(answer.Handwriting.Strokes);
+        double targetX = targetRun.UnionBounds.X + targetRun.UnionBounds.Width / 2;
+        double targetY = targetRun.UnionBounds.Y + targetRun.UnionBounds.Height / 2;
+
+        vm.StampAnswer(source.Region.Id, targetX - answerX, targetY - answerY, targetX, targetY);
+
+        Assert.True(targetRun.SourceStrokeIds.All(id => vm.Document.Strokes.All(stroke => stroke.Id != id)));
+        Assert.True(vm.Document.Strokes.Count >= before.Length - targetRun.SourceStrokeIds.Count);
+
+        vm.Document.Undo();
+        Assert.Equal(before.Select(stroke => stroke.Id), vm.Document.Strokes.Select(stroke => stroke.Id));
+    }
+
+    [Fact]
+    public async Task StampOnItsSourceLineHidesCommittedAnswerImmediately()
+    {
+        var query = ExpressionRegion("5+7=", 0, "5", "+", "7", "=");
+        using MainWindowViewModel vm = Create(new QueueRecognizer(new[] { query }));
+        AddInk(vm, query);
+        await vm.RecognizeNowAsync();
+        AnswerAnimation answer = vm.AnswerLayer.Answers.Single();
+
+        double dropX = query.Region.Bounds.X + query.Region.Bounds.Width + 10;
+        double dropY = query.Region.Bounds.Y + query.Region.Bounds.Height / 2;
+        vm.StampAnswer(answer.OwnerId, dx: 0, dy: 0, dropX, dropY);
+
+        Assert.Empty(vm.AnswerLayer.Answers);
+    }
+
+    [Fact]
+    public async Task FarHorizontalDropAlignedWithExistingLineIsRejectedInsteadOfMerging()
+    {
+        var query = ExpressionRegion("5+7=", 0, "5", "+", "7", "=");
+        using MainWindowViewModel vm = Create(new QueueRecognizer(new[] { query }));
+        AddInk(vm, query);
+        await vm.RecognizeNowAsync();
+        AnswerAnimation answer = vm.AnswerLayer.Answers.Single();
+        int before = vm.Document.Strokes.Count;
+
+        vm.StampAnswer(answer.OwnerId, dx: 900, dy: 0, dropX: 1000, dropY: 25);
+
+        Assert.Equal(before, vm.Document.Strokes.Count);
+        Assert.Contains("move vertically", vm.RecognitionText, StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static TimeSpan LiveQuietPeriodPlus() =>
+        MainWindowViewModel.LiveQuietPeriod + TimeSpan.FromMilliseconds(10);
+
+    private static double StrokeHeight(IReadOnlyList<Stroke> strokes)
+    {
+        double min = double.MaxValue;
+        double max = double.MinValue;
+        foreach (StrokeSample sample in strokes.SelectMany(stroke => stroke.Samples))
+        {
+            min = Math.Min(min, sample.Y);
+            max = Math.Max(max, sample.Y);
+        }
+
+        return max - min;
+    }
+
+    private static (double X, double Y) StrokeCenter(IReadOnlyList<Stroke> strokes)
+    {
+        StrokeSample[] samples = strokes.SelectMany(stroke => stroke.Samples).ToArray();
+        return ((samples.Min(sample => sample.X) + samples.Max(sample => sample.X)) / 2,
+            (samples.Min(sample => sample.Y) + samples.Max(sample => sample.Y)) / 2);
+    }
+
+    private static MainWindowViewModel Create(IRegionRecognizer recognizer, IGlyphBank? bank = null, TimeProvider? time = null) => new(
         recognizer,
         new SheetGraph(new AngouriMathEvaluator(), new AngouriMathExpressionAnalyzer()),
         bank,
         new HandwritingSynthesizer(new[] { new AnyGlyphSource() }),
-        RecognitionCalibration.Default);
+        RecognitionCalibration.Default,
+        time);
 
     private static RegionRecognition Region(
         string latex, double y, Guid? id = null, Guid? strokeId = null, bool dirty = true)
@@ -301,6 +672,30 @@ public sealed class MainWindowViewModelTests
         var token = new RecognizedToken("=", new[] { sid }, bounds, .99);
         var region = new InkRegion(id ?? Guid.NewGuid(), new[] { sid }, bounds, new[] { new StrokeGroup(new[] { stroke }, bounds) });
         return new RegionRecognition(region, new RecognitionResult(latex, new[] { token }, .99, .99), dirty);
+    }
+
+    private static RegionRecognition ExpressionRegion(string latex, double y, params string[] labels)
+    {
+        var strokes = new List<Stroke>(labels.Length);
+        var tokens = new List<RecognizedToken>(labels.Length);
+        for (int i = 0; i < labels.Length; i++)
+        {
+            Guid strokeId = Guid.NewGuid();
+            double x = 10 + i * 28;
+            var stroke = new Stroke(strokeId, new[]
+            {
+                new StrokeSample(x, y + 10, TimeSpan.Zero, .5),
+                new StrokeSample(x + 16, y + 40, TimeSpan.FromMilliseconds(20), .5),
+            });
+            var bounds = new InkBounds(x, y + 10, 16, 30);
+            strokes.Add(stroke);
+            tokens.Add(new RecognizedToken(labels[i], new[] { strokeId }, bounds, .99));
+        }
+
+        InkBounds regionBounds = new(10, y + 10, Math.Max(16, labels.Length * 28 - 12), 30);
+        var groups = strokes.Zip(tokens, (stroke, token) => new StrokeGroup(new[] { stroke }, token.Bounds)).ToArray();
+        var region = new InkRegion(Guid.NewGuid(), strokes.Select(stroke => stroke.Id).ToArray(), regionBounds, groups);
+        return new RegionRecognition(region, new RecognitionResult(latex, tokens, .99, .99), Dirty: true);
     }
 
     private static void AddInk(MainWindowViewModel vm, params RegionRecognition[] regions)
@@ -378,5 +773,94 @@ public sealed class MainWindowViewModelTests
         public bool Has(string symbol) => false;
         public IReadOnlyList<GlyphSample> Samples(string symbol) => Array.Empty<GlyphSample>();
         public GlyphSample? Sample(string symbol, Random random) => null;
+    }
+
+    // Returns whatever the current Next delegate maps the live strokes to — reconfigurable between passes,
+    // so a test can build a result that references ids only known after an intervening stamp.
+    private sealed class FuncRecognizer : IRegionRecognizer
+    {
+        public Func<IReadOnlyList<Stroke>, IReadOnlyList<RegionRecognition>> Next { get; set; }
+            = _ => Array.Empty<RegionRecognition>();
+        public IReadOnlyList<RegionRecognition> RecognizeRegions(IReadOnlyList<Stroke> strokes, IReadOnlyList<RegionRecognition>? previous = null, CancellationToken cancellationToken = default) => throw new NotSupportedException();
+        public Task<IReadOnlyList<RegionRecognition>> RecognizeRegionsAsync(IReadOnlyList<Stroke> strokes, IReadOnlyList<RegionRecognition>? previous = null, CancellationToken cancellationToken = default) =>
+            Task.FromResult(Next(strokes));
+    }
+
+    // Counts the reads it is asked to perform; used to observe that a debounced fire actually ran.
+    private sealed class CountingRecognizer : IRegionRecognizer
+    {
+        public int Calls { get; private set; }
+        public IReadOnlyList<RegionRecognition> RecognizeRegions(IReadOnlyList<Stroke> strokes, IReadOnlyList<RegionRecognition>? previous = null, CancellationToken cancellationToken = default) => throw new NotSupportedException();
+        public Task<IReadOnlyList<RegionRecognition>> RecognizeRegionsAsync(IReadOnlyList<Stroke> strokes, IReadOnlyList<RegionRecognition>? previous = null, CancellationToken cancellationToken = default)
+        {
+            Calls++;
+            return Task.FromResult<IReadOnlyList<RegionRecognition>>(Array.Empty<RegionRecognition>());
+        }
+    }
+
+    // Minimal controllable clock, mirroring Penumbra.Core's DebouncerTests: one-shot timers fire in due
+    // order as Advance walks past them. Enough surface for the live-recognition debouncer.
+    private sealed class FakeTimeProvider : TimeProvider
+    {
+        private readonly List<FakeTimer> _timers = new();
+        private DateTimeOffset _now = new(2026, 1, 1, 0, 0, 0, TimeSpan.Zero);
+
+        public override DateTimeOffset GetUtcNow() => _now;
+
+        public override ITimer CreateTimer(TimerCallback callback, object? state, TimeSpan dueTime, TimeSpan period)
+        {
+            var timer = new FakeTimer(callback, state)
+            {
+                Due = dueTime == Timeout.InfiniteTimeSpan ? null : _now + dueTime,
+            };
+            _timers.Add(timer);
+            return timer;
+        }
+
+        public void Advance(TimeSpan by)
+        {
+            DateTimeOffset target = _now + by;
+            while (true)
+            {
+                FakeTimer? next = _timers
+                    .Where(t => !t.Disposed && t.Due is not null && t.Due <= target)
+                    .OrderBy(t => t.Due)
+                    .FirstOrDefault();
+                if (next is null)
+                {
+                    break;
+                }
+
+                _now = next.Due!.Value;
+                next.Due = null;
+                next.Fire();
+            }
+
+            _now = target;
+        }
+
+        private sealed class FakeTimer : ITimer
+        {
+            private readonly TimerCallback _callback;
+            private readonly object? _state;
+
+            public FakeTimer(TimerCallback callback, object? state)
+            {
+                _callback = callback;
+                _state = state;
+            }
+
+            public DateTimeOffset? Due { get; set; }
+            public bool Disposed { get; private set; }
+
+            public void Fire() => _callback(_state);
+            public bool Change(TimeSpan dueTime, TimeSpan period) => false;
+            public void Dispose() => Disposed = true;
+            public ValueTask DisposeAsync()
+            {
+                Dispose();
+                return ValueTask.CompletedTask;
+            }
+        }
     }
 }

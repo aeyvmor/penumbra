@@ -1,4 +1,3 @@
-using System.Text;
 using Penumbra.Core;
 
 namespace Penumbra.Recognition;
@@ -175,36 +174,27 @@ public sealed class ExpressionRecognizer : IRecognizer, IRegionRecognizer
         string[] labels = RewriteDigitContext(predictions);
 
         var tokens = new List<RecognizedToken>(groups.Count);
-        var latex = new StringBuilder();
         double confidenceSum = 0;
         double minConfidence = double.PositiveInfinity;
 
         for (int i = 0; i < groups.Count; i++)
         {
             StrokeGroup group = groups[i];
-            string label = labels[i];
             tokens.Add(new RecognizedToken(
-                label,
+                labels[i],
                 group.Strokes.Select(s => s.Id).ToList(),
                 group.Bounds,
                 predictions[i].Confidence,
                 predictions[i].Rejected));   // B4: the OOD flag rides Seam 1 so the gate can see it
 
-            // 3.9a: a control word ("\pi", "\times", …) needs a trailing separator, else "\pi"
-            // followed by "x" assembles to "\pix" — a phantom variable the translator reads as
-            // "pix". Digits and letters stay directly concatenated (multi-digit numbers depend on
-            // it: "2""1" must be 21, not a spaced "2 1" the translator would turn into 2*1).
-            latex.Append(label);
-            if (label.StartsWith('\\'))
-            {
-                latex.Append(' ');
-            }
-
             confidenceSum += predictions[i].Confidence;
             minConfidence = Math.Min(minConfidence, predictions[i].Confidence);
         }
 
-        return new RecognitionResult(latex.ToString().TrimEnd(), tokens, confidenceSum / groups.Count, minConfidence);
+        // 3.9a token-assembly rule (control-word separator + trailing trim) lives in
+        // TokenLatexAssembler so taffy literal-splicing reproduces this exact LaTeX.
+        string latex = TokenLatexAssembler.Assemble(labels);
+        return new RecognitionResult(latex, tokens, confidenceSum / groups.Count, minConfidence);
     }
 
     // 3.9b/3.9g: glyph confusions the classifier can't resolve from shape alone. Two distinct rules:
