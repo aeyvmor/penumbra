@@ -8,11 +8,14 @@ namespace Penumbra.Recognition;
 /// energy crossed the calibrated reject threshold. Classifiers without calibration (the test fakes) leave
 /// both at their defaults — energy <c>0</c>, not rejected — so their construction sites need no change.
 /// </summary>
+public readonly record struct SymbolAlternative(string Label, double Confidence);
+
 public readonly record struct SymbolPrediction(
     string Label,
     double Confidence,
     double Energy = 0,
-    bool Rejected = false);
+    bool Rejected = false,
+    IReadOnlyList<SymbolAlternative>? Alternatives = null);
 
 /// <summary>
 /// Classifies a single segmented symbol's strokes (one <see cref="StrokeGroup"/>) into a label.

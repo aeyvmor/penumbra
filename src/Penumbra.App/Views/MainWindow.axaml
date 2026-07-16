@@ -2,6 +2,7 @@
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         xmlns:vm="using:Penumbra.App.ViewModels"
         xmlns:controls="using:Penumbra.App.Controls"
+        xmlns:views="using:Penumbra.App.Views"
         xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
         xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
         mc:Ignorable="d" d:DesignWidth="800" d:DesignHeight="450"
@@ -19,7 +20,7 @@
         <vm:MainWindowViewModel/>
     </Design.DataContext>
 
-    <DockPanel>
+    <DockPanel x:Name="Workspace">
         <Border DockPanel.Dock="Top"
                 Background="#FFFFFF"
                 BorderBrush="#E2E6EC"
@@ -52,11 +53,26 @@
                 BorderBrush="#E2E6EC"
                 BorderThickness="0,1,0,0"
                 Padding="12,8">
-            <TextBlock Text="{Binding RecognitionText}"
-                       FontSize="18"
-                       FontWeight="SemiBold"
-                       Foreground="#18202A"/>
+            <StackPanel Spacing="2">
+                <TextBlock Text="{Binding RecognitionText}"
+                           FontSize="18"
+                           FontWeight="SemiBold"
+                           Foreground="#18202A"/>
+                <TextBlock Text="{Binding PersistenceStatus}"
+                           FontSize="12"
+                           Foreground="#5C6673"/>
+                <TextBlock Text="{Binding RecoveryCheckpointStatus}"
+                           FontSize="12"
+                           Foreground="#5C6673"/>
+            </StackPanel>
         </Border>
+
+        <!-- Phase 6: auto-shows when the page has at least one graphable y=f(x) line (its own IsVisible
+             binds HasCurves); collapses to nothing otherwise so plain math keeps the full canvas. -->
+        <views:GraphPanelView x:Name="GraphPanel"
+                              DockPanel.Dock="Right"
+                              Width="380"
+                              DataContext="{Binding GraphPanel}"/>
 
         <controls:InkCanvasControl x:Name="InkCanvas"
                                    Document="{Binding Document}"

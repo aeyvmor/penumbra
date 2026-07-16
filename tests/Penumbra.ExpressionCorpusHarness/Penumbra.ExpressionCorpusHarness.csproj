@@ -1,0 +1,25 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <None Include="..\..\assets\Caveat-VariableFont_wght.ttf" Link="assets\Caveat-VariableFont_wght.ttf">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\Penumbra.Cas\Penumbra.Cas.csproj" />
+    <ProjectReference Include="..\..\src\Penumbra.Core\Penumbra.Core.csproj" />
+    <ProjectReference Include="..\..\src\Penumbra.Ink\Penumbra.Ink.csproj" />
+    <ProjectReference Include="..\..\src\Penumbra.Recognition\Penumbra.Recognition.csproj" />
+    <ProjectReference Include="..\..\src\Penumbra.Runtime\Penumbra.Runtime.csproj" />
+    <ProjectReference Include="..\..\src\Penumbra.Sheet\Penumbra.Sheet.csproj" />
+  </ItemGroup>
+
+</Project>

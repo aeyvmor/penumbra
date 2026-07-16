@@ -15,13 +15,18 @@ namespace Penumbra.Core;
 ///   moved to render time. The persisted shape did not otherwise change.</description></item>
 ///   <item><description><b>v3</b>—adds neutral per-region recognition and result snapshots. Raw
 ///   strokes remain the source of truth; dependencies and transient rendering state are rebuilt.</description></item>
+///   <item><description><b>v4</b> adds document-level stroke provenance and a recognition-pipeline
+///   fingerprint. Raw strokes remain loadable even when either metadata surface is untrusted.</description></item>
 /// </list>
 /// </para>
 /// </summary>
 public static class PenumbraDocumentSerializer
 {
+    /// <summary>The first schema that can make explicit stroke-provenance and cache-fingerprint claims.</summary>
+    public const int ProvenanceSchemaVersion = 4;
+
     /// <summary>Current on-disk schema version.</summary>
-    public const int SchemaVersion = 3;
+    public const int SchemaVersion = 4;
 
     private static readonly JsonSerializerOptions Options = new()
     {
@@ -33,7 +38,9 @@ public static class PenumbraDocumentSerializer
         Array.Empty<Stroke>(),
         new Dictionary<string, string>(),
         SchemaVersion,
-        Array.Empty<PersistedRegion>());
+        Array.Empty<PersistedRegion>(),
+        Array.Empty<PersistedStrokeMetadata>(),
+        string.Empty);
 
     /// <summary>Serializes a document to indented JSON.</summary>
     public static string Serialize(PenumbraDocument document)
@@ -50,15 +57,6 @@ public static class PenumbraDocumentSerializer
             ?? throw new FormatException("Document JSON deserialized to null.");
         ValidateVersion(document.Version);
         return Normalize(document);
-    }
-
-    /// <summary>Writes a document to a <c>.pen</c> file.</summary>
-    public static async Task SaveAsync(PenumbraDocument document, string path, CancellationToken ct = default)
-    {
-        ArgumentNullException.ThrowIfNull(document);
-        ValidateVersion(document.Version);
-        await using FileStream stream = File.Create(path);
-        await JsonSerializer.SerializeAsync(stream, Normalize(document), Options, ct);
     }
 
     /// <summary>Reads and validates a supported document from a <c>.pen</c> file.</summary>
@@ -84,19 +82,47 @@ public static class PenumbraDocumentSerializer
 
     private static PenumbraDocument Normalize(PenumbraDocument document)
     {
+        IReadOnlyList<Stroke> strokes = (document.Strokes ?? Array.Empty<Stroke>())
+            .Where(stroke => stroke is not null)
+            .Select(stroke => stroke with
+            {
+                Samples = stroke.Samples ?? Array.Empty<StrokeSample>(),
+            })
+            .ToArray();
         IReadOnlyList<PersistedRegion> regions = (document.Regions ?? Array.Empty<PersistedRegion>())
             .Where(region => region is not null)
             .Select(Normalize)
             .ToArray();
+        // v1-v3 are permanently legacy. Do not couple this migration boundary to the moving current
+        // schema version or a future bump would erase valid v4 provenance.
+        IReadOnlyList<PersistedStrokeMetadata> strokeMetadata = document.Version < ProvenanceSchemaVersion
+            ? strokes
+                .Select(stroke => stroke.Id)
+                .Distinct()
+                .Select(strokeId => new PersistedStrokeMetadata(
+                    strokeId,
+                    StrokeOriginNames.LegacyUnspecified))
+                .ToArray()
+            : (document.StrokeMetadata ?? Array.Empty<PersistedStrokeMetadata>())
+                .Where(metadata => metadata is not null)
+                .Select(metadata => metadata with
+                {
+                    Origin = metadata.Origin ?? string.Empty,
+                })
+                .ToArray();
 
         // System.Text.Json can supply null for absent collection properties even when the public
-        // contract is annotated non-null. Normalize at the persistence boundary so downstream code
-        // gets safe empty collections while stroke/sample values themselves stay untouched.
+        // contract is annotated non-null. Discard only invalid null containers/elements; every valid
+        // raw stroke and sample value remains represented by the JSON value model.
         return document with
         {
-            Strokes = document.Strokes ?? Array.Empty<Stroke>(),
+            Strokes = strokes,
             Variables = document.Variables ?? new Dictionary<string, string>(),
             Regions = regions,
+            StrokeMetadata = strokeMetadata,
+            RecognitionPipelineFingerprint = document.Version < ProvenanceSchemaVersion
+                ? string.Empty
+                : document.RecognitionPipelineFingerprint ?? string.Empty,
         };
     }
 

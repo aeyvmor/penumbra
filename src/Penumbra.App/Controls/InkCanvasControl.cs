@@ -9,6 +9,7 @@ using Avalonia.VisualTree;
 using Penumbra.Core;
 using Penumbra.Ink;
 using Penumbra.Recognition;
+using Penumbra.Runtime;
 
 namespace Penumbra.App.Controls;
 
@@ -82,7 +83,7 @@ public sealed class InkCanvasControl : Control
     // 4.5d tap geometry, in SCREEN pixels so the gesture feels the same at any zoom: a tap's samples all
     // stay within the slop, and the tap counts only if it lands within the tolerance of answer ink.
     private const double TapSlopScreenPx = 6;
-    private const double TapToleranceScreenPx = 12;
+    private const double TapToleranceScreenPx = PageTaffyController.HitToleranceScreenPixels;
     private const double EraserToleranceScreenPx = 14;
 
     // 5.3 A1 hold-to-grab, in SCREEN units so the gesture feels identical at any zoom: press on an answer
@@ -1119,7 +1120,10 @@ public sealed class InkCanvasControl : Control
             double worldY = (screen.Y - _offsetY) / _scale;
 
             double factor = e.Delta.Y >= 0 ? 1.1 : 1 / 1.1;
-            _scale = Math.Clamp(_scale * factor, 0.1, 20);
+            _scale = Math.Clamp(
+                _scale * factor,
+                PageTaffyController.MinimumCanvasScale,
+                PageTaffyController.MaximumCanvasScale);
 
             // Keep the world point under the cursor pinned in place as we zoom.
             _offsetX = screen.X - worldX * _scale;

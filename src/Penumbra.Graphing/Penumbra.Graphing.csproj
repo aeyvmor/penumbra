@@ -2,6 +2,13 @@
 
   <ItemGroup>
     <ProjectReference Include="..\Penumbra.Core\Penumbra.Core.csproj" />
+    <!-- Engine-to-engine reference, same pattern as Sheet -> Cas: Graphing needs LatexToAngouriMath's
+         dialect and, uniquely among engines, AngouriMath's own Entity.Compile for numeric sampling. -->
+    <ProjectReference Include="..\Penumbra.Cas\Penumbra.Cas.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="AngouriMath" Version="1.4.0" />
   </ItemGroup>
 
   <PropertyGroup>

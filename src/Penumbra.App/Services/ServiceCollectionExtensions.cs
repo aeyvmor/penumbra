@@ -1,4 +1,5 @@
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.DependencyInjection.Extensions;
 using Penumbra.App.ViewModels;
 using Penumbra.Cas;
 using Penumbra.Core;
@@ -15,19 +16,42 @@ public static class ServiceCollectionExtensions
     /// <summary>Adds Penumbra services to the dependency-injection container.</summary>
     public static IServiceCollection AddPenumbraApp(this IServiceCollection services)
     {
-        services.AddSingleton<IStrokeSegmenter, OverlapStrokeSegmenter>();
-        services.AddSingleton<ISymbolClassifier, OnnxSymbolClassifier>();
+        // Local diagnostics are opt-in and process-wide. TryAdd preserves a harness-provided bounded sink;
+        // normal app startup resolves the allocation/timestamp-free singleton no-op.
+        services.TryAddSingleton<ILocalMetricsSink>(_ => NoOpLocalMetricsSink.Instance);
+        services.TryAddSingleton<TimeProvider>(_ => TimeProvider.System);
+        services.TryAddSingleton<IPageStore>(sp => new FileSystemPageStore(
+            sp.GetRequiredService<ILocalMetricsSink>(),
+            sp.GetRequiredService<TimeProvider>()));
+
+        services.TryAddSingleton<IStrokeSegmenter, OverlapStrokeSegmenter>();
+        services.TryAddSingleton<IRegionSegmenter, RegionSegmenter>();
+        services.TryAddSingleton<ISymbolClassifier, OnnxSymbolClassifier>();
         // One recognizer owns both the legacy and region-aware seams. Registering the concrete once is
         // important: two instances could carry different model/calibration state and make manual and live
-        // reads disagree even though they appear to use the same implementation.
-        services.AddSingleton<ExpressionRecognizer>();
+        // reads disagree even though they appear to use the same implementation. An explicit factory avoids
+        // constructor-selection ambiguity while honoring every pre-registered recognition dependency.
+        services.TryAddSingleton(sp => new ExpressionRecognizer(
+            sp.GetRequiredService<IStrokeSegmenter>(),
+            sp.GetRequiredService<IRegionSegmenter>(),
+            sp.GetRequiredService<ISymbolClassifier>(),
+            sp.GetRequiredService<ILocalMetricsSink>(),
+            sp.GetRequiredService<TimeProvider>()));
         services.AddSingleton<IRecognizer>(sp => sp.GetRequiredService<ExpressionRecognizer>());
         services.AddSingleton<IRegionRecognizer>(sp => sp.GetRequiredService<ExpressionRecognizer>());
         services.AddSingleton<IEvaluator, AngouriMathEvaluator>();
         services.AddSingleton<IExpressionAnalyzer, AngouriMathExpressionAnalyzer>();
         // A graph is page/VM state, never an application singleton. Every window receives an isolated sheet.
         services.AddTransient<SheetGraph>();
-        services.AddSingleton<IGraphDetector, NoOpGraphDetector>();
+
+        // Phase 6: the real graphing seams. Both are stateless per-call engines, so singletons are safe, and
+        // both observe through the same local metrics/time seams the recognizer uses.
+        services.AddSingleton<IGraphDetector>(sp => new GraphDetector(
+            sp.GetRequiredService<ILocalMetricsSink>(),
+            sp.GetRequiredService<TimeProvider>()));
+        services.AddSingleton<IDomainSampler>(sp => new DomainSampler(
+            sp.GetRequiredService<ILocalMetricsSink>(),
+            sp.GetRequiredService<TimeProvider>()));
 
         // B4: the decision contract (reject/bank bars, temperature + energy applied in-classifier) rides
         // the model artifact — the ViewModel gets whatever the loaded meta.json ships, with

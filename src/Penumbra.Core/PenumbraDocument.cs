@@ -8,12 +8,24 @@ namespace Penumbra.Core;
 /// ignored. Schema v3 stores neutral recognition and result snapshots, but deliberately does not
 /// persist dependency edges or other derived Sheet state. Rebuilding those facts through the Sheet
 /// API on load prevents an old cache from becoming an authoritative—and potentially wrong—graph.
+/// Schema v4 adds document-level stroke provenance and a recognition-pipeline fingerprint while raw
+/// <see cref="Stroke"/> geometry remains unchanged.
 /// </remarks>
 public sealed record PenumbraDocument(
     IReadOnlyList<Stroke> Strokes,
     IReadOnlyDictionary<string, string> Variables,
     int Version,
-    IReadOnlyList<PersistedRegion> Regions = null!);
+    IReadOnlyList<PersistedRegion> Regions = null!,
+    IReadOnlyList<PersistedStrokeMetadata> StrokeMetadata = null!,
+    string RecognitionPipelineFingerprint = "");
+
+/// <summary>Document-level provenance for one persisted stroke ID.</summary>
+/// <remarks>
+/// <see cref="Origin"/> is intentionally a string so newer producers can add origin values without
+/// making older readers reject otherwise valid raw ink. Consumers resolve unknown or ambiguous values
+/// conservatively through <see cref="StrokeProvenanceResolver"/>.
+/// </remarks>
+public sealed record PersistedStrokeMetadata(Guid StrokeId, string Origin);
 
 /// <summary>
 /// A stable recognition-region snapshot stored by schema v3. The types live in Core so the on-disk

@@ -10,13 +10,16 @@ namespace Penumbra.Recognition;
 /// The caller owns the round trip: only the list returned by the last successfully applied pass may
 /// be supplied as <c>previous</c> on the next pass. A cancelled or superseded pass must
 /// be discarded wholesale. Implementations reuse a prior <see cref="RecognitionResult"/> verbatim
-/// when its matched region has the same stroke set; only dirty regions may invoke classification.
+/// only when its matched region has the same stroke set and
+/// <see cref="RegionRecognition.RequiresAuthoritativeRecognition"/> is false. A forced persisted hint
+/// may stabilize region identity but must be reclassified and returned with that marker cleared.
 /// </remarks>
 public interface IRegionRecognizer
 {
     /// <summary>
-    /// Segments and incrementally recognizes <paramref name="strokes"/>, reusing clean results from
-    /// <paramref name="previous"/>. The returned list is the complete next round-trip state.
+    /// Segments and incrementally recognizes <paramref name="strokes"/>, reusing clean non-forced results
+    /// from <paramref name="previous"/>. The returned list is the complete next round-trip state and must
+    /// not retain any authoritative-recognition marker.
     /// </summary>
     IReadOnlyList<RegionRecognition> RecognizeRegions(
         IReadOnlyList<Stroke> strokes,

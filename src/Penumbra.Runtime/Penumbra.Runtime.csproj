@@ -1,0 +1,17 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\Penumbra.Cas\Penumbra.Cas.csproj" />
+    <ProjectReference Include="..\Penumbra.Core\Penumbra.Core.csproj" />
+    <ProjectReference Include="..\Penumbra.Ink\Penumbra.Ink.csproj" />
+    <ProjectReference Include="..\Penumbra.Recognition\Penumbra.Recognition.csproj" />
+    <ProjectReference Include="..\Penumbra.Sheet\Penumbra.Sheet.csproj" />
+  </ItemGroup>
+
+</Project>

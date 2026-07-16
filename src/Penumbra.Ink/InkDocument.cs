@@ -10,6 +10,10 @@ namespace Penumbra.Ink;
 public sealed class InkDocument
 {
     private readonly List<Stroke> _strokes = new();
+    // A GUID is a persistence key, not an object identity: hostile files and undo branches can reuse one
+    // ID for distinct strokes. Keep their origins separate until a present-ID query resolves ambiguity.
+    private readonly Dictionary<Stroke, StrokeOriginKind> _strokeOrigins =
+        new(ReferenceEqualityComparer.Instance);
     private readonly Stack<IInkEdit> _undo = new();
     private readonly Stack<IInkEdit> _redo = new();
 
@@ -23,9 +27,14 @@ public sealed class InkDocument
     public event EventHandler? Changed;
 
     /// <summary>Appends a finished stroke and records it as an undoable edit.</summary>
-    public void AddStroke(Stroke stroke)
+    public void AddStroke(Stroke stroke) => AddStroke(stroke, StrokeOriginKind.UserInk);
+
+    /// <summary>Appends a finished stroke with an explicit writable origin as an undoable edit.</summary>
+    public void AddStroke(Stroke stroke, StrokeOriginKind origin)
     {
         ArgumentNullException.ThrowIfNull(stroke);
+        ValidateNewStrokeOrigin(origin);
+        RegisterOrigin(stroke, origin);
         Apply(new AddStrokeEdit(stroke));
     }
 
@@ -36,9 +45,16 @@ public sealed class InkDocument
     /// a harmless no-op that records no history and raises no event; otherwise exactly one
     /// <see cref="Changed"/> fires per call and, like any fresh edit, the redo branch is discarded.
     /// </summary>
-    public void AddStrokes(IEnumerable<Stroke> strokes)
+    public void AddStrokes(IEnumerable<Stroke> strokes) =>
+        AddStrokes(strokes, StrokeOriginKind.UserInk);
+
+    /// <summary>
+    /// Appends a batch with one explicit writable origin as a single undoable edit.
+    /// </summary>
+    public void AddStrokes(IEnumerable<Stroke> strokes, StrokeOriginKind origin)
     {
         ArgumentNullException.ThrowIfNull(strokes);
+        ValidateNewStrokeOrigin(origin);
 
         var batch = strokes.ToList();
         if (batch.Count == 0)
@@ -46,6 +62,7 @@ public sealed class InkDocument
             return;
         }
 
+        RegisterOrigins(batch, origin);
         Apply(new AddStrokesEdit(batch));
     }
 
@@ -106,10 +123,20 @@ public sealed class InkDocument
     /// <see cref="Changed"/> event fires, undo restores the removed strokes at their exact original indices
     /// and removes the addition, and redo reapplies the same replacement.
     /// </summary>
-    public void ReplaceStrokes(IEnumerable<Guid> removedIds, IEnumerable<Stroke> addedStrokes)
+    public void ReplaceStrokes(IEnumerable<Guid> removedIds, IEnumerable<Stroke> addedStrokes) =>
+        ReplaceStrokes(removedIds, addedStrokes, StrokeOriginKind.UserInk);
+
+    /// <summary>
+    /// Atomically replaces strokes and assigns one explicit writable origin to every addition.
+    /// </summary>
+    public void ReplaceStrokes(
+        IEnumerable<Guid> removedIds,
+        IEnumerable<Stroke> addedStrokes,
+        StrokeOriginKind addedOrigin)
     {
         ArgumentNullException.ThrowIfNull(removedIds);
         ArgumentNullException.ThrowIfNull(addedStrokes);
+        ValidateNewStrokeOrigin(addedOrigin);
 
         HashSet<Guid> requested = removedIds.ToHashSet();
         var removals = new List<(int Index, Stroke Stroke)>();
@@ -127,7 +154,38 @@ public sealed class InkDocument
             return;
         }
 
+        RegisterOrigins(additions, addedOrigin);
         Apply(new ReplaceStrokesEdit(removals, additions));
+    }
+
+    /// <summary>
+    /// Gets the origin of one uniquely identified present stroke. Missing, empty, or duplicate IDs are
+    /// conservatively <see cref="StrokeOriginKind.Unknown"/>.
+    /// </summary>
+    public StrokeOriginKind GetStrokeOrigin(Guid strokeId)
+    {
+        if (strokeId == Guid.Empty)
+        {
+            return StrokeOriginKind.Unknown;
+        }
+
+        Stroke? match = null;
+        foreach (Stroke stroke in _strokes)
+        {
+            if (stroke.Id != strokeId)
+            {
+                continue;
+            }
+
+            if (match is not null)
+            {
+                return StrokeOriginKind.Unknown;
+            }
+
+            match = stroke;
+        }
+
+        return match is null ? StrokeOriginKind.Unknown : GetInstanceOrigin(match);
     }
 
     /// <summary>Reverts the most recent edit, if any.</summary>
@@ -159,19 +217,97 @@ public sealed class InkDocument
     }
 
     /// <summary>Snapshots the current strokes into a persistable document.</summary>
-    public PenumbraDocument ToDocument() =>
-        PenumbraDocumentSerializer.CreateEmpty() with { Strokes = _strokes.ToList() };
+    public PenumbraDocument ToDocument() => PenumbraDocumentSerializer.CreateEmpty() with
+    {
+        Strokes = _strokes.ToList(),
+        StrokeMetadata = _strokes
+            .Select(stroke => new PersistedStrokeMetadata(
+                stroke.Id,
+                ToPersistedOrigin(GetInstanceOrigin(stroke))))
+            .ToList(),
+    };
 
     /// <summary>Replaces all content from a loaded document and discards the edit history.</summary>
     public void Load(PenumbraDocument document)
     {
         ArgumentNullException.ThrowIfNull(document);
+        StrokeProvenanceResolution provenance = StrokeProvenanceResolver.Resolve(document);
+        Stroke[] strokes = (document.Strokes ?? Array.Empty<Stroke>())
+            .Where(stroke => stroke is not null)
+            .ToArray();
+
         _strokes.Clear();
-        _strokes.AddRange(document.Strokes);
+        _strokes.AddRange(strokes);
+        _strokeOrigins.Clear();
+        foreach (Stroke stroke in strokes)
+        {
+            _strokeOrigins[stroke] = provenance.GetOrigin(stroke.Id);
+        }
+
         _undo.Clear();
         _redo.Clear();
         Changed?.Invoke(this, EventArgs.Empty);
     }
+
+    private static void ValidateNewStrokeOrigin(StrokeOriginKind origin)
+    {
+        if (origin is not StrokeOriginKind.UserInk and not StrokeOriginKind.SynthesizedInk)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(origin),
+                origin,
+                "New ink must be identified as user or synthesized ink.");
+        }
+    }
+
+    private static string ToPersistedOrigin(StrokeOriginKind origin) => origin switch
+    {
+        StrokeOriginKind.UserInk => StrokeOriginNames.UserInk,
+        StrokeOriginKind.SynthesizedInk => StrokeOriginNames.SynthesizedInk,
+        StrokeOriginKind.LegacyUnspecified => StrokeOriginNames.LegacyUnspecified,
+        _ => string.Empty,
+    };
+
+    private static void RemoveByReference(List<Stroke> strokes, Stroke stroke)
+    {
+        int index = strokes.FindIndex(candidate => ReferenceEquals(candidate, stroke));
+        if (index >= 0)
+        {
+            strokes.RemoveAt(index);
+        }
+    }
+
+    private void RegisterOrigins(IEnumerable<Stroke> strokes, StrokeOriginKind origin)
+    {
+        Stroke[] batch = strokes.ToArray();
+        foreach (Stroke stroke in batch)
+        {
+            ArgumentNullException.ThrowIfNull(stroke);
+        }
+
+        foreach (Stroke stroke in batch)
+        {
+            RegisterOrigin(stroke, origin);
+        }
+    }
+
+    private void RegisterOrigin(Stroke stroke, StrokeOriginKind origin)
+    {
+        // Reusing the exact same object with two claimed origins cannot be represented honestly. Keep
+        // the geometry/edit valid but make that instance conservatively non-bankable.
+        if (_strokeOrigins.TryGetValue(stroke, out StrokeOriginKind existing) && existing != origin)
+        {
+            _strokeOrigins[stroke] = StrokeOriginKind.Unknown;
+            return;
+        }
+
+        _strokeOrigins[stroke] = origin;
+    }
+
+    private StrokeOriginKind GetInstanceOrigin(Stroke stroke) =>
+        _strokeOrigins.TryGetValue(stroke, out StrokeOriginKind origin)
+            ? origin
+            : StrokeOriginKind.Unknown;
 
     private void Apply(IInkEdit edit)
     {
@@ -196,7 +332,7 @@ public sealed class InkDocument
 
         public void Apply(List<Stroke> strokes) => strokes.Add(_stroke);
 
-        public void Revert(List<Stroke> strokes) => strokes.Remove(_stroke);
+        public void Revert(List<Stroke> strokes) => RemoveByReference(strokes, _stroke);
     }
 
     private sealed class AddStrokesEdit : IInkEdit
@@ -238,7 +374,7 @@ public sealed class InkDocument
         {
             foreach ((_, Stroke stroke) in _removed)
             {
-                strokes.Remove(stroke);
+                RemoveByReference(strokes, stroke);
             }
         }
 
@@ -270,7 +406,7 @@ public sealed class InkDocument
         {
             foreach ((_, Stroke stroke) in _removed)
             {
-                strokes.Remove(stroke);
+                RemoveByReference(strokes, stroke);
             }
 
             strokes.AddRange(_added);

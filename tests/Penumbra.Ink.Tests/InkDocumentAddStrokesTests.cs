@@ -4,9 +4,9 @@ using Penumbra.Ink;
 namespace Penumbra.Ink.Tests;
 
 /// <summary>
-/// The compound <see cref="InkDocument.AddStrokes"/> edit: a multi-stroke insertion (a re-inked
-/// taffy literal, a synthesized answer) lands in order and undoes/redoes as ONE step, mirroring the
-/// batch-erase contract.
+/// The compound <see cref="InkDocument.AddStrokes(IEnumerable{Stroke})"/> edit: a multi-stroke insertion
+/// (a re-inked taffy literal, a synthesized answer) lands in order and undoes/redoes as ONE step,
+/// mirroring the batch-erase contract.
 /// </summary>
 public sealed class InkDocumentAddStrokesTests
 {

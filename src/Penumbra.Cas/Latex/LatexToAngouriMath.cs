@@ -166,8 +166,27 @@ public static class LatexToAngouriMath
 
                 case '!':
                     scanner.Next();
-                    sb.Append('!');
-                    prevIsValue = true;
+                    if (!scanner.Eof && scanner.Peek() == '=')
+                    {
+                        // AngouriMath spells not-equal "<>". Passing "!=" through is parsed as
+                        // factorial followed by equality (2! = 3), which is a convincing false result.
+                        scanner.Next();
+                        EmitOperator("<>");
+                    }
+                    else
+                    {
+                        sb.Append('!');
+                        // Preserve the lexical boundary after postfix factorial. Adjacent "!=" is
+                        // deliberately not-equal, while "3! = 5" is factorial equality; without this
+                        // one space the translated strings collide before SplitEquation can distinguish them.
+                        if (!scanner.Eof && char.IsWhiteSpace(scanner.Peek()))
+                        {
+                            sb.Append(' ');
+                        }
+
+                        prevIsValue = true;
+                    }
+
                     break;
 
                 case '|':
@@ -207,7 +226,7 @@ public static class LatexToAngouriMath
             }
         }
 
-        return sb.ToString();
+        return sb.ToString().TrimEnd();
     }
 
     /// <summary>Consumes <paramref name="open"/>, translates until <paramref name="close"/>, consumes it.</summary>
@@ -381,7 +400,15 @@ public static class LatexToAngouriMath
                 return CommandToken.Operator(">=");
 
             case "neq" or "ne":
-                return CommandToken.Operator("!=");
+                // AngouriMath's comparison grammar uses "<>". Its parser reads "!=" as factorial
+                // plus equality, so preserving the familiar spelling would silently change the math.
+                return CommandToken.Operator("<>");
+
+            case "lt":
+                // R1's shipped relation class is the LaTeX control word "\lt". Leaving it to the
+                // generic command fallback turns "2\lt3" into the plausible symbolic product
+                // "2*lt*3" — a silent wrong rather than a visible parse failure.
+                return CommandToken.Operator("<");
 
             // Delimiter sizing only — drop it; the bracket itself is read next.
             case "left" or "right":

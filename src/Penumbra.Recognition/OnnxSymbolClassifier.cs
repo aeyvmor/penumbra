@@ -156,14 +156,31 @@ public sealed class OnnxSymbolClassifier : ISymbolClassifier, IDisposable
         return predictions;
     }
 
+    /// <summary>Ranked alternatives exposed per prediction (winner + up to this many runners-up).</summary>
+    private const int TopKAlternatives = 5;
+
     /// <summary>
     /// One symbol's logits → calibrated prediction. Single and batch paths both land here, so temperature
     /// scaling and energy rejection can never diverge between them (the batch-vs-single parity test pins it).
+    /// <see cref="RecognitionCalibration.Apply"/> alone decides <c>Label</c>/<c>Confidence</c>/<c>Energy</c>/
+    /// <c>Rejected</c> — <see cref="SymbolPrediction.Alternatives"/> is filled from a separate, independent
+    /// <see cref="RecognitionCalibration.RankedConfidences"/> call over the same logits, so adding it can
+    /// never perturb the top-1 contract (proved on the parity fixture in
+    /// <c>OnnxSymbolClassifierTests.Alternatives_DoNotChangeTop1_AndTopEntryMatchesPrediction</c>).
     /// </summary>
     private SymbolPrediction Predict(float[] logits)
     {
         (int best, double confidence, double energy, bool rejected) = Calibration.Apply(logits);
-        return new SymbolPrediction(_classes[best], confidence, energy, rejected);
+
+        IReadOnlyList<(int Index, double Confidence)> ranked = Calibration.RankedConfidences(logits);
+        int k = Math.Min(TopKAlternatives, ranked.Count);
+        var alternatives = new SymbolAlternative[k];
+        for (int i = 0; i < k; i++)
+        {
+            alternatives[i] = new SymbolAlternative(_classes[ranked[i].Index], ranked[i].Confidence);
+        }
+
+        return new SymbolPrediction(_classes[best], confidence, energy, rejected, alternatives);
     }
 
     public void Dispose() => _session.Dispose();

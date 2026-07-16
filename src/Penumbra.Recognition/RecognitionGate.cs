@@ -1,4 +1,5 @@
 using Penumbra.Core;
+using Penumbra.Core.Layout;
 
 namespace Penumbra.Recognition;
 
@@ -10,6 +11,18 @@ namespace Penumbra.Recognition;
 /// override confidence. When any symbol is uncertain we refuse the whole line rather than compute on a
 /// guess, and we name the offending symbol (1-based) so the user knows exactly what to rewrite. Kept
 /// headless here so the decision is unit-tested without the UI.
+/// <para>
+/// Phase 5.5 slice 4 adds a second, independent refusal: a non-accepted <see cref="LayoutParseOutcome"/>
+/// (<see cref="RecognitionResult.ParseOutcome"/>) refuses the line even when every symbol individually
+/// scored well — the grammar found the SHAPE untrustworthy (unmatched bracket, raised token, ambiguous
+/// function word, …), not any one glyph. <b>Precedence:</b> the per-symbol confidence/OOD gate runs
+/// FIRST — a shaky glyph is named specifically, which is more actionable than a shape-level message, and
+/// a genuinely uncertain symbol can make the grammar's own read of the line unreliable in the first
+/// place. Only once every symbol clears that bar does a structural refusal get a chance to fire. A null
+/// <see cref="RecognitionResult.ParseOutcome"/> (every pre-existing construction site: test fakes,
+/// <see cref="NoOpRecognizer"/>, hand-built results) carries no structural opinion, so behaviour for
+/// those callers is unchanged byte-for-byte.
+/// </para>
 /// </summary>
 public static class RecognitionGate
 {
@@ -32,17 +45,47 @@ public static class RecognitionGate
         ArgumentNullException.ThrowIfNull(result);
 
         int shakiest = IndexOfShakiestUncertain(result.Tokens, threshold);
-        if (shakiest < 0)
+        if (shakiest >= 0)
         {
-            return new GateResult(Accepted: true, SymbolPosition: 0, Refusal: null);
+            int position = shakiest + 1;   // 1-based for the user
+            return new GateResult(
+                Accepted: false,
+                SymbolPosition: position,
+                Refusal: $"couldn't read that (symbol {position} looks ambiguous)");
         }
 
-        int position = shakiest + 1;   // 1-based for the user
-        return new GateResult(
-            Accepted: false,
-            SymbolPosition: position,
-            Refusal: $"couldn't read that (symbol {position} looks ambiguous)");
+        // Structural refusal (Phase 5.5): only reached once every symbol individually cleared the
+        // confidence/OOD bar above. A null outcome means the caller carries no structural opinion at all
+        // (test fakes, NoOpRecognizer, hand-built results) — accept, exactly as before this slice.
+        if (result.ParseOutcome is { IsAccepted: false } outcome)
+        {
+            return new GateResult(
+                Accepted: false,
+                SymbolPosition: 0,
+                Refusal: StructuralRefusalMessage(outcome.Reason));
+        }
+
+        return new GateResult(Accepted: true, SymbolPosition: 0, Refusal: null);
     }
+
+    /// <summary>A polite, reason-specific message for a structural (non-accepted) parse outcome.</summary>
+    private static string StructuralRefusalMessage(ParseRefusalReason reason) => reason switch
+    {
+        ParseRefusalReason.UnmatchedBracket => "couldn't read that (a bracket doesn't have a match)",
+        ParseRefusalReason.UncertainScript =>
+            "couldn't read that (a symbol's position looks like a script, not plain text)",
+        ParseRefusalReason.GeneralSubscript => "couldn't read that (that subscript isn't supported yet)",
+        ParseRefusalReason.AmbiguousFractionOwnership => "couldn't read that (a fraction's parts are unclear)",
+        ParseRefusalReason.EmptyRadicalOwnership => "couldn't read that (that radical isn't supported yet)",
+        ParseRefusalReason.AmbiguousFunctionWord => "couldn't read that (a function name has no argument)",
+        ParseRefusalReason.DigitProductAmbiguity => "couldn't read that (a digit grouping looks ambiguous)",
+        ParseRefusalReason.UnsupportedRelation => "couldn't read that (that relation isn't supported yet)",
+        ParseRefusalReason.UnsupportedNotation => "couldn't read that (that notation isn't supported yet)",
+        ParseRefusalReason.LostStroke => "couldn't read that (a stroke got lost while reading)",
+        ParseRefusalReason.DoubleOwnership => "couldn't read that (a stroke got read twice)",
+        ParseRefusalReason.LowMargin => "couldn't read that (two readings looked equally likely)",
+        _ => "couldn't read that",
+    };
 
     /// <summary>
     /// The strokes behind every uncertain token (Phase 4.5c) — below-threshold or energy-rejected — the

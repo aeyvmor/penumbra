@@ -4,8 +4,9 @@ namespace Penumbra.Core.Tests;
 
 public sealed class PenumbraDocumentSerializerTests
 {
-    private static PenumbraDocument SampleDocument() => new(
-        Strokes: new[]
+    private static PenumbraDocument SampleDocument()
+    {
+        Stroke[] strokes =
         {
             new Stroke(Guid.NewGuid(), new[]
             {
@@ -16,9 +17,18 @@ public sealed class PenumbraDocumentSerializerTests
             {
                 new StrokeSample(10, 10, TimeSpan.FromMilliseconds(40), 0.5),
             }),
-        },
-        Variables: new Dictionary<string, string> { ["x"] = "5" },
-        Version: PenumbraDocumentSerializer.SchemaVersion);
+        };
+
+        return new PenumbraDocument(
+            Strokes: strokes,
+            Variables: new Dictionary<string, string> { ["x"] = "5" },
+            Version: PenumbraDocumentSerializer.SchemaVersion,
+            Regions: Array.Empty<PersistedRegion>(),
+            StrokeMetadata: strokes
+                .Select(stroke => new PersistedStrokeMetadata(stroke.Id, StrokeOriginNames.UserInk))
+                .ToArray(),
+            RecognitionPipelineFingerprint: "test-pipeline-v1");
+    }
 
     private static void AssertSameStrokes(PenumbraDocument expected, PenumbraDocument actual)
     {
@@ -65,11 +75,13 @@ public sealed class PenumbraDocumentSerializerTests
         Assert.Empty(result.Strokes);
         Assert.Empty(result.Variables);
         Assert.Empty(result.Regions!);
+        Assert.Empty(result.StrokeMetadata!);
+        Assert.Empty(result.RecognitionPipelineFingerprint);
         Assert.Equal(PenumbraDocumentSerializer.SchemaVersion, result.Version);
     }
 
     [Fact]
-    public async Task SaveLoadFileRoundTripsV3State()
+    public async Task LoadFileRoundTripsSerializedV4State()
     {
         Guid strokeId = Guid.NewGuid();
         Guid regionId = Guid.NewGuid();
@@ -94,12 +106,17 @@ public sealed class PenumbraDocumentSerializerTests
                     new PersistedRecognition("x=5", new[] { token }, 0.94, 0.94),
                     new PersistedNodeResult("5", "5", true, "Numeric")),
             },
+            StrokeMetadata = new[]
+            {
+                new PersistedStrokeMetadata(strokeId, StrokeOriginNames.SynthesizedInk),
+            },
+            RecognitionPipelineFingerprint = "recognizer-layout-v4",
         };
         string path = Path.Combine(Path.GetTempPath(), $"penumbra-test-{Guid.NewGuid():N}.pen");
 
         try
         {
-            await PenumbraDocumentSerializer.SaveAsync(original, path);
+            await File.WriteAllTextAsync(path, PenumbraDocumentSerializer.Serialize(original));
             PenumbraDocument loaded = await PenumbraDocumentSerializer.LoadAsync(path);
 
             AssertSameStrokes(original, loaded);
@@ -114,6 +131,8 @@ public sealed class PenumbraDocumentSerializerTests
             Assert.Equal(token.Confidence, loadedToken.Confidence);
             Assert.Equal(token.Rejected, loadedToken.Rejected);
             Assert.Equal(new PersistedNodeResult("5", "5", true, "Numeric"), loadedRegion.NodeResult);
+            Assert.Equal(original.StrokeMetadata, loaded.StrokeMetadata);
+            Assert.Equal("recognizer-layout-v4", loaded.RecognitionPipelineFingerprint);
         }
         finally
         {
@@ -148,13 +167,14 @@ public sealed class PenumbraDocumentSerializerTests
     }
 
     [Fact]
-    public void SchemaVersionIsThree()
+    public void SchemaVersionIsFour()
     {
-        Assert.Equal(3, PenumbraDocumentSerializer.SchemaVersion);
+        Assert.Equal(4, PenumbraDocumentSerializer.SchemaVersion);
+        Assert.Equal(4, PenumbraDocumentSerializer.ProvenanceSchemaVersion);
     }
 
     [Fact]
-    public void RoundTripsCompleteVersion3RegionState()
+    public void RoundTripsCompleteVersion4RegionAndProvenanceState()
     {
         Guid firstStrokeId = Guid.Parse("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa");
         Guid secondStrokeId = Guid.Parse("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb");
@@ -180,7 +200,13 @@ public sealed class PenumbraDocumentSerializerTests
                     new InkBounds(-2.5, 4.25, 18, 12),
                     new PersistedRecognition("\\frac{x}{2}=", new[] { firstToken }, 0.9, 0.876),
                     new PersistedNodeResult("x / 2", "x / 2", false, "Symbolic")),
-            });
+            },
+            new[]
+            {
+                new PersistedStrokeMetadata(firstStrokeId, StrokeOriginNames.UserInk),
+                new PersistedStrokeMetadata(secondStrokeId, StrokeOriginNames.SynthesizedInk),
+            },
+            "recognizer-layout-v4");
 
         PenumbraDocument loaded = PenumbraDocumentSerializer.Deserialize(
             PenumbraDocumentSerializer.Serialize(original));
@@ -201,6 +227,8 @@ public sealed class PenumbraDocumentSerializerTests
         Assert.Equal(firstToken.Bounds, loadedToken.Bounds);
         Assert.Equal(firstToken.Confidence, loadedToken.Confidence);
         Assert.True(loadedToken.Rejected);
+        Assert.Equal(original.StrokeMetadata, loaded.StrokeMetadata);
+        Assert.Equal("recognizer-layout-v4", loaded.RecognitionPipelineFingerprint);
     }
 
     [Fact]
@@ -225,6 +253,12 @@ public sealed class PenumbraDocumentSerializerTests
 
         Assert.Equal(2, document.Version);
         Assert.Empty(document.Regions!);
+        Assert.Equal(
+            new PersistedStrokeMetadata(
+                Guid.Parse("22222222-2222-2222-2222-222222222222"),
+                StrokeOriginNames.LegacyUnspecified),
+            Assert.Single(document.StrokeMetadata!));
+        Assert.Empty(document.RecognitionPipelineFingerprint);
         Assert.Equal(
             new StrokeSample(1.2345678, -9.8765432, TimeSpan.FromTicks(12345), 0.123456),
             document.Strokes[0].Samples[0]);
@@ -253,11 +287,147 @@ public sealed class PenumbraDocumentSerializerTests
         PersistedRegion region = Assert.Single(document.Regions!);
         Assert.Empty(region.StrokeIds);
         Assert.Empty(region.Recognition.Tokens);
+        Assert.Empty(document.StrokeMetadata!);
+        Assert.Empty(document.RecognitionPipelineFingerprint);
+    }
+
+    [Theory]
+    [InlineData(1)]
+    [InlineData(2)]
+    [InlineData(3)]
+    public void LegacyVersionsMigrateEachUniquePresentStrokeToLegacyUnspecified(int version)
+    {
+        string json = $$"""
+        {
+          "Strokes": [
+            { "Id": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa", "Samples": [] },
+            { "Id": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa", "Samples": [] },
+            { "Id": "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb", "Samples": [] }
+          ],
+          "Variables": {},
+          "Version": {{version}},
+          "Regions": [],
+          "StrokeMetadata": [
+            { "StrokeId": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa", "Origin": "UserInk" }
+          ],
+          "RecognitionPipelineFingerprint": "must-not-survive-legacy-migration"
+        }
+        """;
+
+        PenumbraDocument document = PenumbraDocumentSerializer.Deserialize(json);
+
+        Assert.Equal(version, document.Version);
+        Assert.Equal(3, document.Strokes.Count);
+        Assert.Equal(
+            new[]
+            {
+                new PersistedStrokeMetadata(
+                    Guid.Parse("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"),
+                    StrokeOriginNames.LegacyUnspecified),
+                new PersistedStrokeMetadata(
+                    Guid.Parse("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"),
+                    StrokeOriginNames.LegacyUnspecified),
+            },
+            document.StrokeMetadata);
+        Assert.Empty(document.RecognitionPipelineFingerprint);
+    }
+
+    [Fact]
+    public void V4HostileMetadataAndDuplicateStrokeIdsHaveStableExactJsonRoundTrip()
+    {
+        // A null stroke/metadata object and a null Samples collection are recoverable container
+        // defects. A literal null inside Samples would be malformed StrokeSample geometry and may
+        // fail honestly because StrokeSample is a non-nullable value type.
+        const string json = """
+        {
+          "Strokes": [
+            null,
+            {
+              "Id": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+              "Samples": [
+                { "X": 1.25, "Y": -2.5, "Time": "00:00:00.0000007", "Pressure": 0.75 }
+              ]
+            },
+            { "Id": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa", "Samples": [] },
+            { "Id": "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb", "Samples": null },
+            { "Id": "dddddddd-dddd-dddd-dddd-dddddddddddd", "Samples": [] }
+          ],
+          "Variables": {},
+          "Version": 4,
+          "Regions": [null],
+          "StrokeMetadata": [
+            null,
+            { "StrokeId": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa", "Origin": "UserInk" },
+            { "StrokeId": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa", "Origin": "SynthesizedInk" },
+            { "StrokeId": "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb", "Origin": "FutureImportedInk" },
+            { "StrokeId": "cccccccc-cccc-cccc-cccc-cccccccccccc", "Origin": "UserInk" }
+          ],
+          "RecognitionPipelineFingerprint": "recognizer-layout-v4"
+        }
+        """;
+
+        PenumbraDocument document = PenumbraDocumentSerializer.Deserialize(json);
+
+        Assert.Equal(4, document.Strokes.Count);
+        Assert.Equal(document.Strokes[0].Id, document.Strokes[1].Id);
+        Assert.Equal(
+            new StrokeSample(1.25, -2.5, TimeSpan.FromTicks(7), 0.75),
+            Assert.Single(document.Strokes[0].Samples));
+        Assert.Empty(document.Strokes[2].Samples);
+        Assert.Equal(4, document.StrokeMetadata.Count);
+        Assert.Equal(
+            new[] { "UserInk", "SynthesizedInk", "FutureImportedInk", "UserInk" },
+            document.StrokeMetadata.Select(metadata => metadata.Origin));
+        Assert.Empty(document.Regions);
+        Assert.Equal("recognizer-layout-v4", document.RecognitionPipelineFingerprint);
+        StrokeProvenanceResolution provenance = StrokeProvenanceResolver.Resolve(document);
+        Assert.Equal(
+            StrokeProvenanceIssues.DuplicateStrokeId
+            | StrokeProvenanceIssues.MissingStrokeMetadata
+            | StrokeProvenanceIssues.DuplicateStrokeMetadata
+            | StrokeProvenanceIssues.StaleStrokeMetadata
+            | StrokeProvenanceIssues.UnknownOrigin,
+            provenance.Issues);
+        Assert.Equal(StrokeOriginKind.Unknown, provenance.GetOrigin(document.Strokes[0].Id));
+        Assert.Equal(StrokeOriginKind.Unknown, provenance.GetOrigin(document.Strokes[2].Id));
+        Assert.Equal(StrokeOriginKind.Unknown, provenance.GetOrigin(document.Strokes[3].Id));
+
+        string normalizedJson = PenumbraDocumentSerializer.Serialize(document);
+        string secondPassJson = PenumbraDocumentSerializer.Serialize(
+            PenumbraDocumentSerializer.Deserialize(normalizedJson));
+
+        Assert.Equal(normalizedJson, secondPassJson);
+        PenumbraDocument secondPass = PenumbraDocumentSerializer.Deserialize(secondPassJson);
+        Assert.Equal(document.Strokes.Select(stroke => stroke.Id), secondPass.Strokes.Select(stroke => stroke.Id));
+        Assert.Equal(document.StrokeMetadata, secondPass.StrokeMetadata);
+    }
+
+    [Fact]
+    public void NullV4CollectionsAndStringsNormalizeToSafeEmptyValues()
+    {
+        const string json = """
+        {
+          "Strokes": null,
+          "Variables": null,
+          "Version": 4,
+          "Regions": null,
+          "StrokeMetadata": null,
+          "RecognitionPipelineFingerprint": null
+        }
+        """;
+
+        PenumbraDocument document = PenumbraDocumentSerializer.Deserialize(json);
+
+        Assert.Empty(document.Strokes);
+        Assert.Empty(document.Variables);
+        Assert.Empty(document.Regions);
+        Assert.Empty(document.StrokeMetadata);
+        Assert.Empty(document.RecognitionPipelineFingerprint);
     }
 
     [Theory]
     [InlineData(0)]
-    [InlineData(4)]
+    [InlineData(5)]
     [InlineData(999)]
     public void RejectsUnsupportedSchemaVersions(int version)
     {
@@ -273,7 +443,7 @@ public sealed class PenumbraDocumentSerializerTests
     public async Task LoadAsyncRejectsFutureSchemaVersion()
     {
         string path = Path.Combine(Path.GetTempPath(), $"penumbra-future-{Guid.NewGuid():N}.pen");
-        await File.WriteAllTextAsync(path, """{ "Strokes": [], "Variables": {}, "Version": 4 }""");
+        await File.WriteAllTextAsync(path, """{ "Strokes": [], "Variables": {}, "Version": 5 }""");
 
         try
         {
@@ -316,5 +486,11 @@ public sealed class PenumbraDocumentSerializerTests
         Assert.Equal(2, doc.Strokes[0].Samples.Count);
         Assert.Equal(new StrokeSample(3.5, -1.25, TimeSpan.FromMilliseconds(16), 0.8), doc.Strokes[0].Samples[1]);
         Assert.Equal("5", doc.Variables["x"]);
+        Assert.Equal(
+            new PersistedStrokeMetadata(
+                Guid.Parse("11111111-1111-1111-1111-111111111111"),
+                StrokeOriginNames.LegacyUnspecified),
+            Assert.Single(doc.StrokeMetadata!));
+        Assert.Empty(doc.RecognitionPipelineFingerprint);
     }
 }

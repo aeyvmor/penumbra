@@ -2,10 +2,11 @@ using Avalonia.Threading;
 using CommunityToolkit.Mvvm.ComponentModel;
 using CommunityToolkit.Mvvm.Input;
 using Penumbra.Cas;
-using Penumbra.Cas.Latex;
 using Penumbra.Core;
+using Penumbra.Graphing;
 using Penumbra.Ink;
 using Penumbra.Recognition;
+using Penumbra.Runtime;
 using Penumbra.Sheet;
 
 namespace Penumbra.App.ViewModels;
@@ -18,10 +19,12 @@ namespace Penumbra.App.ViewModels;
 public partial class MainWindowViewModel : ViewModelBase, IDisposable
 {
     private static readonly IReadOnlySet<Guid> NoStrokes = new HashSet<Guid>();
+    private static long s_explicitSaveGeneration;
     private const string IdleHint = "Write expressions on separate lines — queries ending in '=' answer when you pause";
 
     internal static readonly TimeSpan LiveQuietPeriod = TimeSpan.FromSeconds(1);
-    internal static readonly TimeSpan TaffyProbeFloor = TimeSpan.FromMilliseconds(33);
+    internal static readonly TimeSpan TaffyProbeFloor = PageTaffyController.ProbeFloor;
+    internal static readonly TimeSpan AutosaveQuietPeriod = TimeSpan.FromSeconds(1.5);
 
     // s19 dogfood: an erase is usually the first half of "erase, then rewrite". Recomputing on the
     // normal quiet period races the user — the half-edited line ('x=' with its value gone) recognizes,
@@ -29,39 +32,35 @@ public partial class MainWindowViewModel : ViewModelBase, IDisposable
     // Stroke-removing edits therefore get a longer window; pen-down still cancels it instantly.
     internal static readonly TimeSpan EraseQuietPeriod = TimeSpan.FromSeconds(2.2);
 
-    private readonly IRegionRecognizer _regionRecognizer;
+    private readonly PageRecognitionSession _pageSession;
+    private readonly PageTaffyController _taffy;
     private readonly SheetGraph _sheet;
     private readonly IGlyphBank? _glyphBank;
     private readonly HandwritingSynthesizer? _synthesizer;
     private readonly RecognitionCalibration _calibration;
     private readonly Debouncer _liveDebouncer;
     private readonly TimeProvider _time;
+    private readonly ILocalMetricsSink _metrics;
+    private readonly IPageStore? _pageStore;
+    private readonly PageAutosaveCoordinator? _autosave;
+    private readonly string? _recoveryPath;
+    private readonly SemaphoreSlim _pageOperationGate = new(1, 1);
+    private readonly Action<Action> _dispatchPersistenceState =
+        static action => Dispatcher.UIThread.Post(action);
     private readonly HashSet<string> _bankedStrokeSets = new();
+    private QuietPeriodMetricState? _quietPeriodMetric;
+    private long _quietPeriodGeneration;
+    private long _documentRevision;
+    private long _durablySavedDocumentRevision;
+    private int _recoveryInspectionCompleted;
+    private int _cleanShutdownInProgress;
 
-    // 5.3 A1: strokes that entered the document as a stamped answer, this session only. They must never
-    // feed the glyph bank — a re-inked answer is not fresh handwriting evidence, and banking the
-    // synthesizer's own output would drift the corpus (jitter of jitter). Not persisted (accepted A1 limit).
-    private readonly HashSet<Guid> _stampedStrokeIds = new();
-
-    // This list is the recognizer's complete round-trip state, including rejected regions. It is replaced
-    // only by an atomically applied latest pass; a cancelled/superseded result never becomes cache authority.
-    private IReadOnlyList<RegionRecognition> _previousRegions = Array.Empty<RegionRecognition>();
-
-    // 5.3 A1: the accepted regions of the last applied pass — the candidate drop lines a stamped answer can
-    // snap to (bounds drive the y-overlap test, tokens the target line height). Kept separate from
-    // _previousRegions so recognition-cache semantics are never touched.
-    private IReadOnlyList<RegionRecognition> _lastAppliedRegions = Array.Empty<RegionRecognition>();
     private CancellationTokenSource? _recognitionCts;
     private long _recognitionGeneration;
     private long _visualSequence;
     private bool _suppressDocumentChanged;
     private int _lastKnownStrokeCount;
     private bool _disposed;
-
-    // 5.3 A2: one non-mutating taffy session. The cache lives only for that gesture: repeated snapped
-    // values reuse byte-identical geometry (no shimmer), while a later gesture revalidates anchors/strokes.
-    private TaffySession? _taffySession;
-    private readonly Dictionary<TaffyGhostCacheKey, SynthesizedHandwriting?> _taffyGhostCache = new();
 
     public MainWindowViewModel()
         : this(
@@ -79,19 +78,50 @@ public partial class MainWindowViewModel : ViewModelBase, IDisposable
         IGlyphBank? glyphBank = null,
         HandwritingSynthesizer? synthesizer = null,
         RecognitionCalibration? calibration = null,
-        TimeProvider? time = null)
+        TimeProvider? time = null,
+        ILocalMetricsSink? metrics = null,
+        IPageStore? pageStore = null,
+        string? recoveryPath = null,
+        IGraphDetector? graphDetector = null,
+        IDomainSampler? domainSampler = null)
     {
         ArgumentNullException.ThrowIfNull(regionRecognizer);
         ArgumentNullException.ThrowIfNull(sheet);
 
-        _regionRecognizer = regionRecognizer;
         _sheet = sheet;
+        // Phase 6: graphing is presentation-adjacent page state. Hosts that pass nothing (design-time,
+        // pre-Phase-6 tests) get the never-accepting detector, so the panel simply stays empty for them.
+        GraphPanel = new GraphPanelViewModel(
+            graphDetector ?? new NoOpGraphDetector(),
+            domainSampler ?? new DomainSampler());
         _glyphBank = glyphBank;
         _synthesizer = synthesizer;
         _calibration = calibration ?? RecognitionCalibration.Default;
+        _pageSession = new PageRecognitionSession(
+            regionRecognizer,
+            sheet,
+            _calibration.MinConfidence);
         _time = time ?? TimeProvider.System;
+        _metrics = metrics ?? NoOpLocalMetricsSink.Instance;
+        _pageStore = pageStore;
+        if (pageStore is not null)
+        {
+            _recoveryPath = Path.GetFullPath(recoveryPath ?? DefaultRecoveryPath());
+            _autosave = new PageAutosaveCoordinator(
+                pageStore,
+                AutosaveQuietPeriod,
+                _time,
+                _metrics);
+            _autosave.StateChanged += OnAutosaveStateChanged;
+        }
 
         Document = new InkDocument();
+        _taffy = new PageTaffyController(
+            _pageSession,
+            Document,
+            _synthesizer,
+            _time,
+            _metrics);
         Document.Changed += (_, _) => OnDocumentChanged();
 
         // The debounce clock is injectable so the live-recognition timing — including the 5.3 drag-cancel
@@ -99,17 +129,53 @@ public partial class MainWindowViewModel : ViewModelBase, IDisposable
         // passes nothing and gets the system clock.
         _liveDebouncer = new Debouncer(
             LiveQuietPeriod,
-            () => Dispatcher.UIThread.Post(() => _ = RecognizeCoreAsync(RecognitionMode.Live)),
-            time);
+            OnLiveQuietPeriodElapsed,
+            _time);
+    }
+
+    /// <summary>Test seam for observing worker completion without owning Avalonia's global dispatcher.</summary>
+    internal MainWindowViewModel(
+        IRegionRecognizer regionRecognizer,
+        SheetGraph sheet,
+        TimeProvider time,
+        IPageStore pageStore,
+        string recoveryPath,
+        Action<Action> dispatchPersistenceState)
+        : this(
+            regionRecognizer,
+            sheet,
+            time: time,
+            pageStore: pageStore,
+            recoveryPath: recoveryPath)
+    {
+        ArgumentNullException.ThrowIfNull(dispatchPersistenceState);
+        _dispatchPersistenceState = dispatchPersistenceState;
     }
 
     public InkDocument Document { get; }
 
     /// <summary>Read-only graph exposure for diagnostics and persistence; mutations remain transactional here.</summary>
-    public IReadOnlyCollection<SheetNode> SheetNodes => _sheet.Nodes;
+    public IReadOnlyCollection<SheetNode> SheetNodes => _pageSession.SheetNodes;
+
+    /// <summary>Phase 6: the graph panel's headless state — curves detected from the accepted page.</summary>
+    public GraphPanelViewModel GraphPanel { get; }
 
     [ObservableProperty]
     private string _recognitionText = IdleHint;
+
+    /// <summary>Visible local save/recovery state; never sent off-device.</summary>
+    [ObservableProperty]
+    private string _persistenceStatus = string.Empty;
+
+    /// <summary>Visible health of the crash-recovery shadow, separate from sticky user-action warnings.</summary>
+    [ObservableProperty]
+    private string _recoveryCheckpointStatus = string.Empty;
+
+    /// <summary>The last explicitly saved/opened local page path, if any.</summary>
+    public string? CurrentPath { get; private set; }
+
+    /// <summary>Whether the current raw-ink revision lacks an exact durable page save.</summary>
+    public bool IsDirty => !IsCurrentDocumentDurable;
 
     /// <summary>Immutable owner-keyed answer overlay, always separate from <see cref="Document"/>.</summary>
     [ObservableProperty]
@@ -129,8 +195,8 @@ public partial class MainWindowViewModel : ViewModelBase, IDisposable
     [ObservableProperty]
     private TaffyGhostLayer? _taffyGhostLayer;
 
-    internal bool IsTaffyActive => _taffySession is not null;
-    internal int TaffyProbeCount { get; private set; }
+    internal bool IsTaffyActive => _taffy.IsActive;
+    internal int TaffyProbeCount => _taffy.ProbeCount;
 
     [ObservableProperty]
     private bool _liveRecognition = true;
@@ -147,8 +213,79 @@ public partial class MainWindowViewModel : ViewModelBase, IDisposable
 
     public void NotifyStrokeStarted()
     {
-        _liveDebouncer.Cancel();
+        CancelLiveRecognitionQuietPeriod();
         CancelRecognition();
+    }
+
+    private void SignalLiveRecognition(TimeSpan quietPeriod)
+    {
+        if (_disposed)
+        {
+            return;
+        }
+
+        long generation = Interlocked.Increment(ref _quietPeriodGeneration);
+
+        // Preserve the default no-op's zero-allocation/zero-timestamp contract all the way through App.
+        if (ReferenceEquals(_metrics, NoOpLocalMetricsSink.Instance))
+        {
+            _liveDebouncer.Signal(quietPeriod, generation);
+            return;
+        }
+
+        var next = new QuietPeriodMetricState(
+            MetricTimingScope.Start(_metrics, MetricOperation.RecognitionQuietPeriod, _time),
+            generation);
+        QuietPeriodMetricState? superseded = Interlocked.Exchange(ref _quietPeriodMetric, next);
+        superseded?.Scope.Cancel();
+        try
+        {
+            _liveDebouncer.Signal(quietPeriod, generation);
+        }
+        catch
+        {
+            Interlocked.CompareExchange(ref _quietPeriodMetric, null, next);
+            next.Scope.Fail();
+            throw;
+        }
+    }
+
+    private void CancelLiveRecognitionQuietPeriod()
+    {
+        Interlocked.Increment(ref _quietPeriodGeneration);
+        _liveDebouncer.Cancel();
+        Interlocked.Exchange(ref _quietPeriodMetric, null)?.Scope.Cancel();
+    }
+
+    private void OnLiveQuietPeriodElapsed(long generation)
+    {
+        // Timer authority and diagnostics are deliberately separate. A replacement signal may arrive after
+        // this callback posts but before the UI applies it; the generation check suppresses that stale work.
+        Dispatcher.UIThread.Post(() =>
+        {
+            if (generation == Volatile.Read(ref _quietPeriodGeneration))
+            {
+                _ = RecognizeCoreAsync(RecognitionMode.Live);
+            }
+        });
+
+        if (!ReferenceEquals(_metrics, NoOpLocalMetricsSink.Instance))
+        {
+            QuietPeriodMetricState? current = Volatile.Read(ref _quietPeriodMetric);
+            if (current is null || current.Generation != generation)
+            {
+                return;
+            }
+
+            if (!ReferenceEquals(
+                    Interlocked.CompareExchange(ref _quietPeriodMetric, null, current),
+                    current))
+            {
+                return;
+            }
+
+            current.Scope.Complete();
+        }
     }
 
     /// <summary>Toggles provenance for one answer owner; overlapping answers never borrow another line's tokens.</summary>
@@ -181,60 +318,28 @@ public partial class MainWindowViewModel : ViewModelBase, IDisposable
     {
         AnswerAnimation? answer = AnswerLayer.Answers.FirstOrDefault(a => a.OwnerId == ownerId);
         IReadOnlyList<Stroke>? source = answer?.Handwriting.Strokes;
-        if (source is null || source.Count == 0)
+        PageStampResult result = PageStampTransaction.Apply(
+            Document,
+            _pageSession.AcceptedRegions,
+            ownerId,
+            source,
+            dx,
+            dy,
+            dropX,
+            dropY);
+        if (result.Refusal == PageStampRefusal.UnsafeHorizontalDrop)
         {
-            return;
-        }
-
-        if (!TryStrokeBounds(source, out double minX, out double minY, out double maxX, out double maxY))
-        {
-            return;
-        }
-
-        double centreX = (minX + maxX) / 2;
-        double centreY = (minY + maxY) / 2;
-
-        RegionRecognition? targetRegion = DropTargetRegion(dropY);
-        LiteralDropTarget? targetLiteral = LiteralTargetAt(dropX, dropY);
-
-        // Match the target line's glyph height when dropped onto one; otherwise keep the answer's own size.
-        double scale = 1.0;
-        double sourceHeight = maxY - minY;
-        if (sourceHeight > 0 && targetRegion is not null)
-        {
-            scale = ClampedMedianTokenHeight(targetRegion.Result.Tokens) / sourceHeight;
-        }
-
-        IReadOnlyList<Stroke> stamped = StrokeTransformer.Transform(source, dx, dy, scale, centreX, centreY);
-        if (targetRegion is not null && targetLiteral is null && !IsNearLine(stamped, targetRegion))
-        {
-            // Regions are intentionally one expression per horizontal line. Ink far to the side but in the
-            // same Y band would still merge into that expression; refuse instead of silently corrupting it.
             RecognitionText = "That space belongs to an existing line — move vertically to create a new line.";
             NotifyAnswerDragCancelled();
             return;
         }
 
-        foreach (Stroke stroke in stamped)
-        {
-            _stampedStrokeIds.Add(stroke.Id);
-        }
-
-        if (targetRegion?.Region.Id == ownerId)
+        if (result.HideSourceAnswer)
         {
             // The committed answer and its real-ink copy would otherwise overlap until the debounced read
             // reclassifies the source line as a statement. Hide it immediately; recognition may restore it
             // if the resulting line remains a query.
             AnswerLayer = new AnswerLayer(AnswerLayer.Answers.Where(item => item.OwnerId != ownerId).ToArray());
-        }
-
-        if (targetLiteral is not null)
-        {
-            Document.ReplaceStrokes(targetLiteral.Run.SourceStrokeIds, stamped);
-        }
-        else
-        {
-            Document.AddStrokes(stamped);
         }
     }
 
@@ -248,7 +353,7 @@ public partial class MainWindowViewModel : ViewModelBase, IDisposable
     {
         if (Document.Strokes.Count > 0 && LiveRecognition)
         {
-            _liveDebouncer.Signal(LiveQuietPeriod);
+            SignalLiveRecognition(LiveQuietPeriod);
         }
     }
 
@@ -262,36 +367,15 @@ public partial class MainWindowViewModel : ViewModelBase, IDisposable
     {
         ArgumentNullException.ThrowIfNull(run);
         EndTaffyCore(resignalRecognition: false);
-
-        SheetNode? node = _sheet.Find(ownerId);
-        LiteralRun? current = LiteralRunLayer.Owners
-            .FirstOrDefault(owner => owner.OwnerId == ownerId)
-            ?.Runs.FirstOrDefault(candidate => SameRun(candidate, run));
-        if (node is null || current is null
-            || current.TokenStart < 0
-            || current.TokenStart + current.TokenCount > node.Tokens.Count)
-        {
-            return false;
-        }
-
-        HashSet<Guid> present = Document.Strokes.Select(stroke => stroke.Id).ToHashSet();
-        if (current.SourceStrokeIds.Count == 0 || current.SourceStrokeIds.Any(id => !present.Contains(id)))
-        {
-            return false;
-        }
-
-        _taffyGhostCache.Clear();
-        TaffyProbeCount = 0;
-        DateTimeOffset now = _time.GetUtcNow();
-        _taffySession = new TaffySession(
+        bool accepted = _taffy.Begin(
             ownerId,
-            current,
-            node.Tokens.ToArray(),
-            current.ValueText,
-            current.ValueText,
-            now - TaffyProbeFloor);
-        PublishTaffyLayer(_taffySession, current.ValueText, report: null);
-        return true;
+            run,
+            AnswerLayer.Answers.Select(answer => answer.OwnerId).ToHashSet());
+        if (accepted)
+        {
+            ApplyTaffyFrame(_taffy.CurrentFrame);
+        }
+        return accepted;
     }
 
     /// <summary>
@@ -302,39 +386,11 @@ public partial class MainWindowViewModel : ViewModelBase, IDisposable
     /// </summary>
     public void UpdateTaffy(double screenDx)
     {
-        TaffySession? session = _taffySession;
-        if (session is null)
+        PageTaffyUpdateResult result = _taffy.Update(screenDx);
+        if (result.Probed)
         {
-            return;
+            ApplyTaffyFrame(result.Frame);
         }
-
-        string valueText;
-        try
-        {
-            valueText = TaffyValueMapper.Map(session.OriginalValueText, screenDx);
-        }
-        catch (Exception ex) when (ex is FormatException or OverflowException)
-        {
-            return; // An out-of-range recognized literal is honestly non-scrubbable, never an app crash.
-        }
-
-        if (string.Equals(valueText, session.LastValueText, StringComparison.Ordinal))
-        {
-            return;
-        }
-
-        DateTimeOffset now = _time.GetUtcNow();
-        if (now - session.LastProbeAt < TaffyProbeFloor)
-        {
-            return;
-        }
-
-        string trialLatex = LiteralRuns.Splice(session.Tokens, session.Run, valueText);
-        SheetProbeReport report = _sheet.Probe(session.OwnerId, trialLatex);
-        session.LastValueText = valueText;
-        session.LastProbeAt = now;
-        TaffyProbeCount++;
-        PublishTaffyLayer(session, valueText, report);
     }
 
     /// <summary>
@@ -346,9 +402,7 @@ public partial class MainWindowViewModel : ViewModelBase, IDisposable
 
     private void EndTaffyCore(bool resignalRecognition)
     {
-        bool wasActive = _taffySession is not null;
-        _taffySession = null;
-        _taffyGhostCache.Clear();
+        bool wasActive = _taffy.End();
         TaffyGhostLayer = null;
         if (wasActive && resignalRecognition)
         {
@@ -356,106 +410,25 @@ public partial class MainWindowViewModel : ViewModelBase, IDisposable
         }
     }
 
-    private static bool SameRun(LiteralRun a, LiteralRun b) =>
-        a.TokenStart == b.TokenStart
-        && a.TokenCount == b.TokenCount
-        && string.Equals(a.ValueText, b.ValueText, StringComparison.Ordinal)
-        && a.SourceStrokeIds.SequenceEqual(b.SourceStrokeIds);
-
-    // The accepted line the drop landed on (y-overlap of its bounds, padded half a line), or null for empty
-    // space. When several overlap, the one whose centre is nearest the drop wins. Tokens drive the height.
-    private RegionRecognition? DropTargetRegion(double dropY)
+    private void ApplyTaffyFrame(PageTaffyFrame? frame)
     {
-        RegionRecognition? best = null;
-        double bestDistance = double.MaxValue;
-        foreach (RegionRecognition region in _lastAppliedRegions)
+        if (frame is null)
         {
-            InkBounds bounds = region.Region.Bounds;
-            double pad = bounds.Height * 0.5;
-            if (dropY < bounds.Y - pad || dropY > bounds.Y + bounds.Height + pad)
-            {
-                continue;
-            }
-
-            double distance = Math.Abs(dropY - (bounds.Y + bounds.Height / 2));
-            if (distance < bestDistance)
-            {
-                bestDistance = distance;
-                best = region;
-            }
+            TaffyGhostLayer = null;
+            return;
         }
 
-        return best;
-    }
-
-    // A direct drop on a recognized literal means replacement, not over-drawing. A modest fraction-of-glyph
-    // pad absorbs hand placement imprecision without turning adjacent insertion positions into replacements.
-    private LiteralDropTarget? LiteralTargetAt(double dropX, double dropY)
-    {
-        LiteralDropTarget? best = null;
-        double bestDistance = double.MaxValue;
-        HashSet<Guid> present = Document.Strokes.Select(stroke => stroke.Id).ToHashSet();
-        foreach (LiteralRunOwner owner in LiteralRunLayer.Owners)
-        {
-            foreach (LiteralRun run in owner.Runs)
-            {
-                InkBounds bounds = run.UnionBounds;
-                double pad = Math.Max(8, bounds.Height * 0.35);
-                bool inside = dropX >= bounds.X - pad && dropX <= bounds.X + bounds.Width + pad
-                    && dropY >= bounds.Y - pad && dropY <= bounds.Y + bounds.Height + pad;
-                if (!inside || run.SourceStrokeIds.Count == 0 || run.SourceStrokeIds.Any(id => !present.Contains(id)))
-                {
-                    continue;
-                }
-
-                double dx = dropX - (bounds.X + bounds.Width / 2);
-                double dy = dropY - (bounds.Y + bounds.Height / 2);
-                double distance = dx * dx + dy * dy;
-                if (distance < bestDistance)
-                {
-                    bestDistance = distance;
-                    best = new LiteralDropTarget(owner.OwnerId, run);
-                }
-            }
-        }
-
-        return best;
-    }
-
-    private static bool IsNearLine(IReadOnlyList<Stroke> stamped, RegionRecognition target)
-    {
-        if (!TryStrokeBounds(stamped, out double minX, out _, out double maxX, out _))
-        {
-            return false;
-        }
-
-        InkBounds bounds = target.Region.Bounds;
-        double gap = maxX < bounds.X
-            ? bounds.X - maxX
-            : minX > bounds.X + bounds.Width ? minX - (bounds.X + bounds.Width) : 0;
-        double lineHeight = ClampedMedianTokenHeight(target.Result.Tokens);
-        return gap <= Math.Max(24, lineHeight * 0.75);
-    }
-
-    private static bool TryStrokeBounds(
-        IReadOnlyList<Stroke> strokes, out double minX, out double minY, out double maxX, out double maxY)
-    {
-        minX = minY = double.MaxValue;
-        maxX = maxY = double.MinValue;
-        bool any = false;
-        foreach (Stroke stroke in strokes)
-        {
-            foreach (StrokeSample sample in stroke.Samples)
-            {
-                any = true;
-                minX = Math.Min(minX, sample.X);
-                minY = Math.Min(minY, sample.Y);
-                maxX = Math.Max(maxX, sample.X);
-                maxY = Math.Max(maxY, sample.Y);
-            }
-        }
-
-        return any;
+        TaffyGhost[] ghosts = frame.Ghosts.Select(ghost => new TaffyGhost(
+            ghost.OwnerId,
+            ghost.ValueText,
+            ghost.Handwriting,
+            ghost.IsLiteral,
+            ghost.LiftScreenPixels)).ToArray();
+        TaffyGhostLayer = new TaffyGhostLayer(
+            frame.MutedStrokeIds,
+            frame.HiddenAnswerOwnerIds,
+            ghosts,
+            ++_visualSequence);
     }
 
     [RelayCommand(CanExecute = nameof(CanRecognize))]
@@ -477,15 +450,12 @@ public partial class MainWindowViewModel : ViewModelBase, IDisposable
         _recognitionCts = cts;
         long generation = ++_recognitionGeneration;
 
-        // Both collections are immutable snapshots while work runs off-thread. In particular, do not pass
-        // InkDocument.Strokes itself: pointer input may mutate it before segmentation finishes.
-        Stroke[] strokes = Document.Strokes.ToArray();
-        RegionRecognition[] previous = _previousRegions.ToArray();
-
-        IReadOnlyList<RegionRecognition> regions;
+        // PageRecognitionSession snapshots both raw ink and its last committed recognition cache before
+        // work leaves the UI thread. Pointer input can therefore never mutate an in-flight pass.
+        PageRecognitionCandidate candidate;
         try
         {
-            regions = await _regionRecognizer.RecognizeRegionsAsync(strokes, previous, cts.Token);
+            candidate = await _pageSession.RecognizeAsync(Document.Strokes, cts.Token);
         }
         catch (OperationCanceledException)
         {
@@ -499,63 +469,41 @@ public partial class MainWindowViewModel : ViewModelBase, IDisposable
             return;
         }
 
-        ApplyRegions(regions, strokes, mode);
+        ApplyRegions(candidate, mode);
     }
 
     private void ApplyRegions(
-        IReadOnlyList<RegionRecognition> regions,
-        IReadOnlyList<Stroke> strokeSnapshot,
+        PageRecognitionCandidate candidate,
         RecognitionMode mode)
     {
-        var accepted = new Dictionary<Guid, RegionRecognition>();
-        var uncertain = new HashSet<Guid>();
-        foreach (RegionRecognition region in regions)
-        {
-            RecognitionGate.GateResult gate = RecognitionGate.Evaluate(region.Result, _calibration.MinConfidence);
-            if (!string.IsNullOrWhiteSpace(region.Result.Latex) && gate.Accepted)
-            {
-                accepted[region.Region.Id] = region;
-            }
-            else
-            {
-                uncertain.UnionWith(RecognitionGate.UncertainStrokeIds(region.Result, _calibration.MinConfidence));
-            }
-        }
-
-        // Apply the whole recognition snapshot as one Sheet transaction: upsert all accepted regions (clean
-        // ones included, because Y-position can change definition ownership), remove absent/rejected nodes,
-        // then recompute exactly once. Rejected state still round-trips above, but never feeds dependents.
-        foreach (Guid id in _sheet.Nodes.Select(node => node.Id).Where(id => !accepted.ContainsKey(id)).ToArray())
-        {
-            _sheet.Remove(id);
-        }
-
-        RegionRecognition[] acceptedRegions = regions.Where(r => accepted.ContainsKey(r.Region.Id)).ToArray();
-        foreach (RegionRecognition region in acceptedRegions)
-        {
-            _sheet.Upsert(region.Region.Id, region.Result.Latex, region.Result.Tokens, region.Region.Bounds);
-        }
+        // This is the shared product transaction used by headless corpus execution too: gate every line,
+        // evict absent/rejected nodes, upsert clean moved lines, then recompute Sheet exactly once.
+        PageRecognitionApplication application = _pageSession.Apply(candidate);
+        IReadOnlyList<RegionRecognition> regions = application.Regions;
+        IReadOnlyList<RegionRecognition> acceptedRegions = application.AcceptedRegions;
+        Dictionary<Guid, RegionRecognition> accepted = acceptedRegions.ToDictionary(
+            region => region.Region.Id);
 
         // 5.3: snapshot accepted lines as stamp targets and publish the literal boxes taffy will validate.
-        _lastAppliedRegions = acceptedRegions;
         PublishLiteralRunLayer(acceptedRegions);
 
-        RecomputeReport report = _sheet.RecomputeDetailed();
-        HashSet<Guid> dirtySources = regions.Where(region => region.Dirty).Select(region => region.Region.Id).ToHashSet();
+        // Phase 6: the same accepted set drives graph detection — a line that stops being accepted drops its
+        // curve on this very pass, and ordinary non-graph math simply never appears in the panel.
+        GraphPanel.UpdateFromAcceptedRegions(acceptedRegions);
 
-        UncertainStrokeIds = uncertain;
+        UncertainStrokeIds = application.UncertainStrokeIds;
         ProvenanceStrokeIds = NoStrokes;
 
-        UpdateAnswers(report, mode);
-        UpdateRipple(report, dirtySources, mode);
+        UpdateAnswers(application.RecomputeReport, mode);
+        UpdateRipple(application.RecomputeReport, application.DirtySourceRegionIds, mode);
         RecognitionText = BuildRecognitionText(regions, accepted);
 
         // Only after every graph/UI mutation has succeeded does this pass become next-pass cache authority.
         // Glyph banking below is a passive side effect, not part of recognition/Sheet correctness.
-        _previousRegions = regions.ToArray();
+        _pageSession.Commit(application);
         if (mode != RecognitionMode.Load)
         {
-            BankNewCompletedQueries(regions, strokeSnapshot);
+            BankNewCompletedQueries(regions, application.StrokeSnapshot);
         }
     }
 
@@ -565,7 +513,9 @@ public partial class MainWindowViewModel : ViewModelBase, IDisposable
         var owners = new List<LiteralRunOwner>(acceptedRegions.Count);
         foreach (RegionRecognition region in acceptedRegions)
         {
-            IReadOnlyList<LiteralRun> runs = LiteralRuns.Find(region.Result.Tokens);
+            IReadOnlyList<LiteralRun> runs = TaffyLiteralTree.Discover(region.Result)
+                .Select(candidate => candidate.Run)
+                .ToArray();
             if (runs.Count > 0)
             {
                 owners.Add(new LiteralRunOwner(region.Region.Id, runs));
@@ -636,36 +586,11 @@ public partial class MainWindowViewModel : ViewModelBase, IDisposable
         AnswerLayer = new AnswerLayer(current.Values.OrderBy(answer => answer.Sequence).ToArray());
     }
 
-    private static bool IsAnswerableQuery(SheetNode node)
-    {
-        return node.Result is { } result && IsUsefulQueryResult(node, result);
-    }
+    private static bool IsAnswerableQuery(SheetNode node) =>
+        PageAnswerMaterializer.IsAnswerableQuery(node);
 
-    private static bool IsUsefulQueryResult(SheetNode node, EvaluationResult result)
-    {
-        if (node.Role != NodeRole.Query || node.IsConflict || !result.IsComputed)
-        {
-            return false;
-        }
-
-        if (result.Kind != EvaluationKind.Symbolic)
-        {
-            return true;
-        }
-
-        // An unresolved identity (`y=` → `y`, `y-2=` → `y-2`) is not an answer; drawing it duplicates
-        // the user's line and interferes with answer stamping. A real symbolic simplification (`y+y=` →
-        // `2y`) still materializes because the translated surfaces differ.
-        string queryExpression = node.Latex.TrimEnd();
-        if (queryExpression.EndsWith('=') && !queryExpression.EndsWith("==", StringComparison.Ordinal))
-        {
-            queryExpression = queryExpression[..^1];
-        }
-
-        string input = LatexToAngouriMath.Translate(queryExpression);
-        string output = LatexToAngouriMath.Translate(result.Latex);
-        return !string.Equals(input, output, StringComparison.Ordinal);
-    }
+    private static bool IsUsefulQueryResult(SheetNode node, EvaluationResult result) =>
+        PageAnswerMaterializer.IsUsefulQueryResult(node, result);
 
     private void UpdateRipple(RecomputeReport report, IReadOnlySet<Guid> dirtySources, RecognitionMode mode)
     {
@@ -709,9 +634,10 @@ public partial class MainWindowViewModel : ViewModelBase, IDisposable
                 DateTimeOffset.UtcNow,
                 _bankedStrokeSets))
             {
-                // 5.3 A1 (D10): never bank a sample drawn from stamped answer ink — it is the synthesizer's
-                // own output re-read, not fresh handwriting, and banking it would drift the corpus.
-                if (_stampedStrokeIds.Count > 0 && sample.Strokes.Any(stroke => _stampedStrokeIds.Contains(stroke.Id)))
+                // Only durable UserInk is admissible. Synthesized answers remain excluded after reopen;
+                // legacy, missing, unknown, or duplicate provenance refuses conservatively.
+                if (sample.Strokes.Any(stroke =>
+                    Document.GetStrokeOrigin(stroke.Id) != StrokeOriginKind.UserInk))
                 {
                     continue;
                 }
@@ -759,146 +685,13 @@ public partial class MainWindowViewModel : ViewModelBase, IDisposable
         IReadOnlyList<RecognizedToken> tokens,
         bool play)
     {
-        (InkBounds Anchor, double LineHeight)? spawn = FindSpawn(tokens);
-        if (_synthesizer is null || spawn is null)
-        {
-            return null;
-        }
-
-        string handwriting = HandwritingText.FromDisplayText(answerText);
-        SynthesizedHandwriting? synthesized = _synthesizer.Synthesize(
-            handwriting,
-            spawn.Value.Anchor,
-            new SynthesisOptions { LineHeight = spawn.Value.LineHeight },
-            new Random());
-        return synthesized is null || synthesized.MissingSymbols.Count > 0
+        SynthesizedHandwriting? synthesized = PageAnswerMaterializer.TrySynthesize(
+            answerText,
+            tokens,
+            _synthesizer);
+        return synthesized is null
             ? null
             : new AnswerAnimation(ownerId, synthesized, ++_visualSequence, play);
-    }
-
-    // Builds one complete immutable taffy frame. The grabbed literal is always represented (when its
-    // glyphs exist); affected query owners hide their committed answers even when the trial errors, so a
-    // stale numeric answer can never masquerade as the hypothetical result.
-    private void PublishTaffyLayer(TaffySession session, string literalValue, SheetProbeReport? report)
-    {
-        var ghosts = new List<TaffyGhost>();
-        SynthesizedHandwriting? literal = TryBuildTaffyHandwriting(
-            new TaffyGhostCacheKey(session.OwnerId, literalValue, IsLiteral: true),
-            HandwritingText.FromDisplayText(literalValue),
-            LiteralSpawn(session.Run, session.Tokens));
-        if (literal is not null)
-        {
-            ghosts.Add(new TaffyGhost(session.OwnerId, literalValue, literal, IsLiteral: true, LiftScreenPx: 10));
-        }
-
-        HashSet<Guid> committedAnswerOwners = AnswerLayer.Answers.Select(answer => answer.OwnerId).ToHashSet();
-        var hidden = new HashSet<Guid>();
-        if (report is not null)
-        {
-            foreach (ProbeEntry entry in report.Entries)
-            {
-                Guid ownerId = entry.Node.Id;
-                if (committedAnswerOwners.Contains(ownerId))
-                {
-                    hidden.Add(ownerId);
-                }
-
-                if (!IsUsefulQueryResult(entry.Node, entry.TrialResult))
-                {
-                    continue;
-                }
-
-                (InkBounds Anchor, double LineHeight)? spawn = FindSpawn(entry.Node.Tokens);
-                if (spawn is null)
-                {
-                    continue;
-                }
-
-                string valueText = entry.TrialResult.DisplayText;
-                SynthesizedHandwriting? answer = TryBuildTaffyHandwriting(
-                    new TaffyGhostCacheKey(ownerId, valueText, IsLiteral: false),
-                    HandwritingText.FromDisplayText(valueText),
-                    spawn.Value);
-                if (answer is not null)
-                {
-                    ghosts.Add(new TaffyGhost(ownerId, valueText, answer, IsLiteral: false));
-                }
-            }
-        }
-
-        TaffyGhostLayer = new TaffyGhostLayer(
-            session.Run.SourceStrokeIds.ToHashSet(),
-            hidden,
-            ghosts,
-            ++_visualSequence);
-    }
-
-    // Positions the first synthesized glyph at the literal's left edge. The canvas applies the vertical
-    // lift in screen pixels so zoom never changes the perceived pickup distance.
-    private static (InkBounds Anchor, double LineHeight) LiteralSpawn(
-        LiteralRun run,
-        IReadOnlyList<RecognizedToken> tokens)
-    {
-        double lineHeight = ClampedMedianTokenHeight(tokens);
-        double gap = new SynthesisOptions().GapAfterAnchor * lineHeight;
-        return (new InkBounds(run.UnionBounds.X - gap, run.UnionBounds.Y, 0, run.UnionBounds.Height), lineHeight);
-    }
-
-    private SynthesizedHandwriting? TryBuildTaffyHandwriting(
-        TaffyGhostCacheKey key,
-        string text,
-        (InkBounds Anchor, double LineHeight) spawn)
-    {
-        if (_taffyGhostCache.TryGetValue(key, out SynthesizedHandwriting? cached))
-        {
-            return cached;
-        }
-
-        SynthesizedHandwriting? synthesized = _synthesizer?.Synthesize(
-            text,
-            spawn.Anchor,
-            new SynthesisOptions { LineHeight = spawn.LineHeight },
-            new Random(StableTaffySeed(key)));
-        if (synthesized is { MissingSymbols.Count: > 0 })
-        {
-            synthesized = null;
-        }
-
-        _taffyGhostCache[key] = synthesized;
-        return synthesized;
-    }
-
-    // string.GetHashCode is process-randomized; this small FNV-1a seed is stable across runs and platforms.
-    private static int StableTaffySeed(TaffyGhostCacheKey key)
-    {
-        unchecked
-        {
-            uint hash = 2166136261;
-            foreach (byte value in key.OwnerId.ToByteArray())
-            {
-                hash = (hash ^ value) * 16777619;
-            }
-
-            foreach (char value in key.ValueText)
-            {
-                hash = (hash ^ value) * 16777619;
-            }
-
-            hash = (hash ^ (key.IsLiteral ? 1u : 0u)) * 16777619;
-            return (int)(hash & 0x7FFFFFFF);
-        }
-    }
-
-    internal static (InkBounds Anchor, double LineHeight)? FindSpawn(IReadOnlyList<RecognizedToken> tokens)
-    {
-        int equalsIndex = -1;
-        for (int i = 0; i < tokens.Count; i++)
-        {
-            if (tokens[i].Latex == "=") equalsIndex = i;
-        }
-
-        if (equalsIndex < 0) return null;
-        return (tokens[equalsIndex].Bounds, ClampedMedianTokenHeight(tokens));
     }
 
     /// <summary>
@@ -907,50 +700,350 @@ public partial class MainWindowViewModel : ViewModelBase, IDisposable
     /// defaulting to 48 for a line with no sizeable tokens. Shared by answer spawning and 5.3 stamp
     /// rescaling so a stamped answer matches the line it lands on the same way a fresh answer is sized.
     /// </summary>
-    internal static double ClampedMedianTokenHeight(IReadOnlyList<RecognizedToken> tokens)
-    {
-        double[] heights = tokens.Where(token => token.Latex != "=").Select(token => token.Bounds.Height).Order().ToArray();
-        double median = heights.Length == 0
-            ? 48
-            : heights.Length % 2 == 1 ? heights[heights.Length / 2] : (heights[heights.Length / 2 - 1] + heights[heights.Length / 2]) / 2;
-        return Math.Clamp(median, 24, 96);
-    }
+    internal static double ClampedMedianTokenHeight(IReadOnlyList<RecognizedToken> tokens) =>
+        PageAnswerMaterializer.ClampedMedianTokenHeight(tokens);
 
-    /// <summary>Builds schema v3 from raw ink plus neutral cache snapshots; no graph edges are serialized.</summary>
-    public PenumbraDocument CreateDocumentSnapshot()
+    /// <summary>
+    /// Builds schema v4 from raw ink, durable stroke provenance, and neutral cache snapshots. No graph
+    /// edges are serialized; the recognition fingerprint makes every cache hint explicitly revocable.
+    /// </summary>
+    public PenumbraDocument CreateDocumentSnapshot() =>
+        PageDocumentSnapshot.Create(Document, _pageSession);
+
+    /// <summary>Durably saves the current UI-thread snapshot to a local page path.</summary>
+    public async Task SavePageAsync(string path, CancellationToken cancellationToken = default)
     {
-        PersistedRegion[] regions = _previousRegions.Select(region =>
+        ArgumentException.ThrowIfNullOrWhiteSpace(path);
+        IPageStore pageStore = _pageStore
+            ?? throw new InvalidOperationException("Page persistence is not configured.");
+        string fullPath = Path.GetFullPath(path);
+        RejectReservedRecoveryPath(fullPath);
+        if (!_pageOperationGate.Wait(0))
         {
-            SheetNode? node = _sheet.Find(region.Region.Id);
-            PersistedNodeResult? result = node?.Result is null ? null : new PersistedNodeResult(
-                node.Result.Latex,
-                node.Result.DisplayText,
-                node.Result.IsComputed,
-                node.Result.Kind.ToString());
-            return new PersistedRegion(
-                region.Region.Id,
-                region.Region.StrokeIds.ToArray(),
-                region.Region.Bounds,
-                new PersistedRecognition(
-                    region.Result.Latex,
-                    region.Result.Tokens.ToArray(),
-                    region.Result.Confidence,
-                    region.Result.MinConfidence),
-                result);
-        }).ToArray();
-        return Document.ToDocument() with { Version = PenumbraDocumentSerializer.SchemaVersion, Regions = regions };
+            PersistenceStatus = "Another page operation is still running; Save was not started.";
+            throw new InvalidOperationException("Page save/open operations cannot overlap.");
+        }
+
+        try
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            long documentRevision = Volatile.Read(ref _documentRevision);
+            PenumbraDocument snapshot = CreateDocumentSnapshot();
+            long generation = Interlocked.Increment(ref s_explicitSaveGeneration);
+            PageSaveResult result = await Task.Run(
+                () => pageStore.SaveAsync(
+                    snapshot,
+                    fullPath,
+                    generation,
+                    PageSaveKind.Explicit,
+                    cancellationToken),
+                cancellationToken);
+            if (result.Status != PageSaveStatus.Committed)
+            {
+                PersistenceStatus = "A newer save superseded this request.";
+                return;
+            }
+
+            if (result.Generation != generation)
+            {
+                throw new IOException(
+                    $"Page store committed generation {result.Generation} for request {generation}.");
+            }
+
+            CurrentPath = fullPath;
+            if (Volatile.Read(ref _documentRevision) == documentRevision)
+            {
+                Volatile.Write(ref _durablySavedDocumentRevision, documentRevision);
+                OnPropertyChanged(nameof(IsDirty));
+                PersistenceStatus = $"Saved {Path.GetFileName(fullPath)} safely.";
+            }
+            else
+            {
+                PersistenceStatus =
+                    $"Saved {Path.GetFileName(fullPath)}, but newer ink still needs another Save.";
+            }
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            PersistenceStatus = "Save cancelled; the previous page remains intact.";
+            throw;
+        }
+        catch
+        {
+            PersistenceStatus = "Save failed; the previous page remains intact.";
+            throw;
+        }
+        finally
+        {
+            _pageOperationGate.Release();
+        }
     }
 
     /// <summary>
-    /// Loads raw ink first, then treats valid v3 snapshots only as recognition cache input. Sheet edges,
-    /// roles, conflicts and results are always rebuilt through segmentation + Upsert + recompute; persisted
-    /// results are never authoritative. v1/v2 naturally supply an empty cache and take the same path.
+    /// Opens the validated current page, or deterministically loads its explicit last-known-good candidate
+    /// without silently promoting that candidate on disk.
+    /// </summary>
+    public async Task<PageOpenResult> OpenPageAsync(
+        string path,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(path);
+        IPageStore pageStore = _pageStore
+            ?? throw new InvalidOperationException("Page persistence is not configured.");
+        string fullPath = Path.GetFullPath(path);
+        RejectReservedRecoveryPath(fullPath);
+        if (IsDirty)
+        {
+            PersistenceStatus = "Save the current page before opening another page.";
+            throw new InvalidOperationException("Opening another page would displace unsaved ink.");
+        }
+
+        if (!_pageOperationGate.Wait(0))
+        {
+            PersistenceStatus = "Another page operation is still running; Open was not started.";
+            throw new InvalidOperationException("Page save/open operations cannot overlap.");
+        }
+
+        bool validatedRawLoadStarted = false;
+        PageOpenStatus? rawSource = null;
+
+        try
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            PageOpenResult result = await Task.Run(
+                () => pageStore.OpenAsync(fullPath, cancellationToken),
+                cancellationToken);
+            if (result.Document is not null
+                && result.Status is PageOpenStatus.Current or PageOpenStatus.BackupRecoveryCandidate)
+            {
+                validatedRawLoadStarted = true;
+                rawSource = result.Status;
+                await LoadDocumentAsync(result.Document);
+                CurrentPath = fullPath;
+                if (result.Status == PageOpenStatus.Current)
+                {
+                    MarkCurrentDocumentDurable();
+                }
+
+                ScheduleRecoverySnapshot();
+                PersistenceStatus = result.Status == PageOpenStatus.Current
+                    ? $"Opened {Path.GetFileName(fullPath)}."
+                    : "Loaded the last-known-good copy; Save explicitly to replace the damaged page.";
+            }
+            else
+            {
+                PersistenceStatus = result.Status == PageOpenStatus.NotFound
+                    ? "That page no longer exists."
+                    : "The page and its recovery copy are both unreadable; nothing was opened.";
+            }
+
+            return result;
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            PersistenceStatus = "Open cancelled.";
+            throw;
+        }
+        catch
+        {
+            if (validatedRawLoadStarted)
+            {
+                CurrentPath = fullPath;
+                if (rawSource == PageOpenStatus.Current)
+                {
+                    MarkCurrentDocumentDurable();
+                }
+
+                ScheduleRecoverySnapshot();
+                PersistenceStatus = "Validated raw ink opened, but recognition failed; the ink is preserved.";
+            }
+            else
+            {
+                PersistenceStatus = "Open failed; the current canvas was left unchanged.";
+            }
+
+            throw;
+        }
+        finally
+        {
+            _pageOperationGate.Release();
+        }
+    }
+
+    /// <summary>
+    /// Deterministically restores a validated interrupted-session checkpoint at startup. The recovered
+    /// page remains unsaved (<see cref="CurrentPath"/> is null) until the user chooses a destination.
+    /// </summary>
+    public async Task<PageOpenResult?> RecoverInterruptedSessionAsync(
+        CancellationToken cancellationToken = default)
+    {
+        if (_pageStore is null || _recoveryPath is null)
+        {
+            return null;
+        }
+
+        if (!_pageOperationGate.Wait(0))
+        {
+            PersistenceStatus = "Another page operation is still running; startup recovery was not started.";
+            throw new InvalidOperationException("Page save/open operations cannot overlap.");
+        }
+
+        bool validatedRawLoadStarted = false;
+        try
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            PageOpenResult result = await Task.Run(
+                () => _pageStore.OpenAsync(_recoveryPath, cancellationToken),
+                cancellationToken);
+            Volatile.Write(ref _recoveryInspectionCompleted, 1);
+            if (result.Document is not null
+                && result.Status is PageOpenStatus.Current or PageOpenStatus.BackupRecoveryCandidate)
+            {
+                validatedRawLoadStarted = true;
+                await LoadDocumentAsync(result.Document);
+                CurrentPath = null;
+                ScheduleRecoverySnapshot();
+                PersistenceStatus = result.Status == PageOpenStatus.Current
+                    ? "Recovered the interrupted local session. Choose Save to keep it."
+                    : "Recovered the last-known-good interrupted session. Choose Save to keep it.";
+            }
+            else if (result.Status == PageOpenStatus.Unrecoverable)
+            {
+                PersistenceStatus = "Interrupted-session recovery data is corrupt; the blank page was kept.";
+            }
+
+            return result;
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            PersistenceStatus = "Startup recovery cancelled.";
+            throw;
+        }
+        catch
+        {
+            if (validatedRawLoadStarted)
+            {
+                CurrentPath = null;
+                ScheduleRecoverySnapshot();
+                PersistenceStatus =
+                    "Recovered validated raw ink, but recognition failed; choose Save to keep the ink.";
+            }
+            else
+            {
+                PersistenceStatus = "Startup recovery failed; the current canvas was left unchanged.";
+            }
+
+            throw;
+        }
+        finally
+        {
+            _pageOperationGate.Release();
+        }
+    }
+
+    /// <summary>Flushes the latest recovery revision, then removes the checkpoint on a clean close.</summary>
+    public async Task CompleteCleanShutdownAsync(CancellationToken cancellationToken = default)
+    {
+        if (_autosave is null || _recoveryPath is null)
+        {
+            return;
+        }
+
+        bool pageOperationHeld = false;
+        try
+        {
+            await _pageOperationGate.WaitAsync(cancellationToken);
+            pageOperationHeld = true;
+
+            if (IsDirty)
+            {
+                // Document edits normally schedule synchronously, but direct validated loads and any
+                // future owner-thread mutation path must still get one exact final checkpoint.
+                _autosave.Schedule(CreateDocumentSnapshot(), _recoveryPath);
+                RecoveryCheckpointStatus = "Final local recovery checkpoint pending.";
+            }
+
+            Interlocked.Exchange(ref _cleanShutdownInProgress, 1);
+
+            await Task.Run(
+                () => _autosave.FlushAsync(cancellationToken),
+                cancellationToken);
+
+            if (Volatile.Read(ref _recoveryInspectionCompleted) == 0
+                && _autosave.LatestRevision == 0)
+            {
+                RecoveryCheckpointStatus =
+                    "Unverified recovery data was kept during this clean close.";
+                return;
+            }
+
+            if (IsDirty)
+            {
+                RecoveryCheckpointStatus =
+                    "Unsaved page retained in local recovery. Choose Save after reopening it.";
+                return;
+            }
+
+            await Task.Run(
+                () =>
+                {
+                    // Delete the older backup first. If either deletion fails, the newest validated
+                    // checkpoint remains at the authoritative current path for a retry/recovery.
+                    File.Delete(FileSystemPageStore.GetBackupPath(_recoveryPath));
+                    File.Delete(_recoveryPath);
+                },
+                cancellationToken);
+            RecoveryCheckpointStatus = "Local recovery checkpoint cleared after a clean close.";
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            Volatile.Write(ref _cleanShutdownInProgress, 0);
+            PersistenceStatus = "Close flush cancelled; recovery data was kept.";
+            if (pageOperationHeld)
+            {
+                ScheduleRecoverySnapshot();
+            }
+            throw;
+        }
+        catch
+        {
+            Volatile.Write(ref _cleanShutdownInProgress, 0);
+            PersistenceStatus = IsCurrentDocumentDurable
+                ? "Close flush failed; recovery data was kept, the saved page is safe, and the window remains open."
+                : "Close flush failed; recovery data was kept and the window remains open.";
+            if (pageOperationHeld)
+            {
+                ScheduleRecoverySnapshot();
+            }
+            throw;
+        }
+        finally
+        {
+            if (pageOperationHeld)
+            {
+                _pageOperationGate.Release();
+            }
+        }
+    }
+
+    /// <summary>Lets the view surface storage-provider failures without coupling Core to Avalonia.</summary>
+    public void ReportPersistenceFailure(string message)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(message);
+        PersistenceStatus = message;
+    }
+
+    /// <summary>
+    /// Loads raw ink first, then treats structurally trusted v4 snapshots from the exact current recognition
+    /// pipeline only as cache input. Sheet edges, roles, conflicts and results are always rebuilt through
+    /// segmentation + Upsert + recompute; persisted results are never authoritative. Legacy, mismatched, or
+    /// hostile cache metadata takes the same fresh-recognition path without displacing raw ink.
     /// </summary>
     public async Task LoadDocumentAsync(PenumbraDocument document)
     {
         ArgumentNullException.ThrowIfNull(document);
         EndTaffyCore(resignalRecognition: false);
-        _liveDebouncer.Cancel();
+        CancelLiveRecognitionQuietPeriod();
         CancelRecognition();
         ++_recognitionGeneration;
         _suppressDocumentChanged = true;
@@ -963,67 +1056,18 @@ public partial class MainWindowViewModel : ViewModelBase, IDisposable
             _suppressDocumentChanged = false;
         }
 
+        Interlocked.Increment(ref _documentRevision);
+        OnPropertyChanged(nameof(IsDirty));
+
         _bankedStrokeSets.Clear();
-        _previousRegions = BuildValidLoadCache(document);
-        _lastAppliedRegions = Array.Empty<RegionRecognition>();
+        _pageSession.Clear();
+        _pageSession.ReplaceCache(PageRecognitionCache.BuildValidLoadCache(document));
         AnswerLayer = AnswerLayer.Empty;
         LiteralRunLayer = LiteralRunLayer.Empty;
+        GraphPanel.Clear();
         CausalityRipple = null;
         ProvenanceStrokeIds = NoStrokes;
         await RecognizeCoreAsync(RecognitionMode.Load);
-    }
-
-    private static IReadOnlyList<RegionRecognition> BuildValidLoadCache(PenumbraDocument document)
-    {
-        IReadOnlyList<PersistedRegion> persistedRegions = document.Regions ?? Array.Empty<PersistedRegion>();
-        if (document.Version < 3 || persistedRegions.Count == 0)
-        {
-            return Array.Empty<RegionRecognition>();
-        }
-
-        // Duplicate stroke ids make a reference ambiguous, so invalidate all cached regions rather than
-        // guessing. Raw ink still loads and will be freshly recognized.
-        HashSet<Guid> ids = document.Strokes.Select(stroke => stroke.Id).ToHashSet();
-        if (ids.Count != document.Strokes.Count)
-        {
-            return Array.Empty<RegionRecognition>();
-        }
-
-        Guid[] persistedRegionIds = persistedRegions.Select(region => region.Id).ToArray();
-        Guid[] referencedStrokeIds = persistedRegions.SelectMany(region => region.StrokeIds).ToArray();
-        if (persistedRegionIds.Any(id => id == Guid.Empty)
-            || persistedRegionIds.Distinct().Count() != persistedRegionIds.Length
-            || referencedStrokeIds.Distinct().Count() != referencedStrokeIds.Length)
-        {
-            // Regions form a partition. Duplicate region ids or cross-region stroke ownership make stable
-            // matching ambiguous; discard the cache wholesale and let current segmentation reconstruct it.
-            return Array.Empty<RegionRecognition>();
-        }
-
-        var valid = new List<RegionRecognition>();
-        foreach (PersistedRegion region in persistedRegions)
-        {
-            HashSet<Guid> regionIds = region.StrokeIds.ToHashSet();
-            bool validRegion = regionIds.Count == region.StrokeIds.Count
-                && regionIds.Count > 0
-                && regionIds.All(ids.Contains)
-                && region.Recognition.Tokens.All(token =>
-                    token.SourceStrokeIds.Count > 0 && token.SourceStrokeIds.All(regionIds.Contains));
-            if (!validRegion)
-            {
-                continue;
-            }
-
-            var placeholder = new InkRegion(region.Id, region.StrokeIds.ToArray(), region.Bounds, Array.Empty<StrokeGroup>());
-            var result = new RecognitionResult(
-                region.Recognition.Latex,
-                region.Recognition.Tokens.ToArray(),
-                region.Recognition.Confidence,
-                region.Recognition.MinConfidence);
-            valid.Add(new RegionRecognition(placeholder, result, Dirty: false));
-        }
-
-        return valid;
     }
 
     private bool CanRecognize => Document.Strokes.Count > 0;
@@ -1042,8 +1086,8 @@ public partial class MainWindowViewModel : ViewModelBase, IDisposable
 
     partial void OnLiveRecognitionChanged(bool value)
     {
-        if (!value) _liveDebouncer.Cancel();
-        else if (Document.Strokes.Count > 0) _liveDebouncer.Signal();
+        if (!value) CancelLiveRecognitionQuietPeriod();
+        else if (Document.Strokes.Count > 0) SignalLiveRecognition(LiveQuietPeriod);
     }
 
     private void OnDocumentChanged()
@@ -1056,6 +1100,13 @@ public partial class MainWindowViewModel : ViewModelBase, IDisposable
         ClearCommand.NotifyCanExecuteChanged();
         RecognizeCommand.NotifyCanExecuteChanged();
         if (_suppressDocumentChanged) return;
+        Interlocked.Increment(ref _documentRevision);
+        OnPropertyChanged(nameof(IsDirty));
+        if (_autosave is not null)
+        {
+            PersistenceStatus =
+                "Unsaved changes are protected by local recovery; choose Save for a page file.";
+        }
 
         // A taffy frame describes the exact committed stroke/token snapshot at grab time. Any document edit
         // invalidates it immediately; the edit's own debounce replaces the no-op end re-signal.
@@ -1078,10 +1129,92 @@ public partial class MainWindowViewModel : ViewModelBase, IDisposable
             PruneLiteralRunLayer();
             if (LiveRecognition)
             {
-                _liveDebouncer.Signal(QuietPeriodFor(previousStrokeCount, Document.Strokes.Count));
+                SignalLiveRecognition(QuietPeriodFor(previousStrokeCount, Document.Strokes.Count));
             }
         }
+
+        ScheduleRecoverySnapshot();
     }
+
+    private void ScheduleRecoverySnapshot()
+    {
+        if (_autosave is null
+            || _recoveryPath is null
+            || _disposed
+            || Volatile.Read(ref _cleanShutdownInProgress) != 0)
+        {
+            return;
+        }
+
+        try
+        {
+            // Called synchronously from the document-owning thread: the coordinator receives only an
+            // immutable snapshot and never reaches back into InkDocument from its timer/I/O work.
+            _autosave.Schedule(CreateDocumentSnapshot(), _recoveryPath);
+            RecoveryCheckpointStatus = "Local recovery checkpoint pending.";
+        }
+        catch
+        {
+            RecoveryCheckpointStatus =
+                "Could not schedule local recovery; explicit Save is still available.";
+        }
+    }
+
+    private void OnAutosaveStateChanged(object? sender, PageAutosaveStateChangedEventArgs args)
+    {
+        void ApplyLatestState()
+        {
+            if (_disposed
+                || Volatile.Read(ref _cleanShutdownInProgress) != 0
+                || _autosave is null
+                || args.Revision != _autosave.LatestRevision)
+            {
+                return;
+            }
+
+            RecoveryCheckpointStatus = args.Committed
+                ? "Local recovery checkpoint saved."
+                : "Local recovery checkpoint failed; explicit Save is still available.";
+        }
+
+        _dispatchPersistenceState(ApplyLatestState);
+    }
+
+    private void MarkCurrentDocumentDurable()
+    {
+        Volatile.Write(
+            ref _durablySavedDocumentRevision,
+            Volatile.Read(ref _documentRevision));
+        OnPropertyChanged(nameof(IsDirty));
+    }
+
+    private bool IsCurrentDocumentDurable =>
+        Volatile.Read(ref _durablySavedDocumentRevision) == Volatile.Read(ref _documentRevision);
+
+    private void RejectReservedRecoveryPath(string fullPath)
+    {
+        if (_recoveryPath is null)
+        {
+            return;
+        }
+
+        StringComparison comparison = OperatingSystem.IsWindows()
+            ? StringComparison.OrdinalIgnoreCase
+            : StringComparison.Ordinal;
+        if (string.Equals(fullPath, _recoveryPath, comparison)
+            || string.Equals(fullPath, FileSystemPageStore.GetBackupPath(_recoveryPath), comparison))
+        {
+            PersistenceStatus =
+                "The internal recovery checkpoint cannot be used as an explicit page path.";
+            throw new InvalidOperationException("The requested path is reserved for session recovery.");
+        }
+    }
+
+    private static string DefaultRecoveryPath() => Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+        "Penumbra",
+        "Recovery",
+        "interrupted-session.pen");
 
     /// <summary>
     /// The debounce window for a document change: stroke-removing edits (erase, undo of an add) wait
@@ -1092,15 +1225,13 @@ public partial class MainWindowViewModel : ViewModelBase, IDisposable
 
     private void ResetTransientState()
     {
-        _liveDebouncer.Cancel();
+        CancelLiveRecognitionQuietPeriod();
         CancelRecognition();
         ++_recognitionGeneration;
-        foreach (Guid id in _sheet.Nodes.Select(node => node.Id).ToArray()) _sheet.Remove(id);
-        _sheet.RecomputeDetailed();
-        _previousRegions = Array.Empty<RegionRecognition>();
-        _lastAppliedRegions = Array.Empty<RegionRecognition>();
+        _pageSession.Clear();
         AnswerLayer = AnswerLayer.Empty;
         LiteralRunLayer = LiteralRunLayer.Empty;
+        GraphPanel.Clear();
         EndTaffyCore(resignalRecognition: false);
         CausalityRipple = null;
         UncertainStrokeIds = NoStrokes;
@@ -1120,31 +1251,22 @@ public partial class MainWindowViewModel : ViewModelBase, IDisposable
     {
         if (_disposed) return;
         _disposed = true;
+        CancelLiveRecognitionQuietPeriod();
         _liveDebouncer.Dispose();
         EndTaffyCore(resignalRecognition: false);
         CancelRecognition();
+        if (_autosave is not null)
+        {
+            _autosave.StateChanged -= OnAutosaveStateChanged;
+        }
+        _autosave?.DisposeAsync().AsTask().GetAwaiter().GetResult();
     }
 
     private enum RecognitionMode { Live, Manual, Load }
 
-    private sealed class TaffySession(
-        Guid ownerId,
-        LiteralRun run,
-        IReadOnlyList<RecognizedToken> tokens,
-        string originalValueText,
-        string lastValueText,
-        DateTimeOffset lastProbeAt)
-    {
-        public Guid OwnerId { get; } = ownerId;
-        public LiteralRun Run { get; } = run;
-        public IReadOnlyList<RecognizedToken> Tokens { get; } = tokens;
-        public string OriginalValueText { get; } = originalValueText;
-        public string LastValueText { get; set; } = lastValueText;
-        public DateTimeOffset LastProbeAt { get; set; } = lastProbeAt;
-    }
-
-    private readonly record struct TaffyGhostCacheKey(Guid OwnerId, string ValueText, bool IsLiteral);
-    private sealed record LiteralDropTarget(Guid OwnerId, LiteralRun Run);
+    private sealed record QuietPeriodMetricState(
+        MetricTimingScope Scope,
+        long Generation);
 
     private sealed class EmptyRegionRecognizer : IRegionRecognizer
     {

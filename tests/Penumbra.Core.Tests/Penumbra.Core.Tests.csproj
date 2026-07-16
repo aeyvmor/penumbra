@@ -20,6 +20,9 @@
 
   <ItemGroup>
     <ProjectReference Include="..\..\src\Penumbra.Core\Penumbra.Core.csproj" />
+    <!-- Test-only: round-trip serializer output through the REAL translator to prove value-safety.
+         Penumbra.Core itself never references Cas (dependency direction App -> engines -> Core). -->
+    <ProjectReference Include="..\..\src\Penumbra.Cas\Penumbra.Cas.csproj" />
   </ItemGroup>
 
 </Project>

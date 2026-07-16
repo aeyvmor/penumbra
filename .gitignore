@@ -11,6 +11,7 @@ x86/
 *.userprefs
 project.lock.json
 artifacts/
+corpus/expressions/.capture-staging/
 .vs/
 
 # ---- Native / CMake build dirs (legacy prototype) ----
@@ -51,7 +52,7 @@ ml/train/*_confusion.png
 ml/export/*.onnx
 ml/export/*.onnx.data
 
-# ---- Models (large; prefer git-lfs — see .gitattributes) ----
+# ---- Models (large; prefer git-lfs â€” see .gitattributes) ----
 # Track final shipped models intentionally; ignore scratch exports.
 models/scratch/
 *.pt
@@ -65,4 +66,3 @@ desktop.ini
 # ---- Logs / temp ----
 *.log
 *.tmp
-.claude/worktrees/

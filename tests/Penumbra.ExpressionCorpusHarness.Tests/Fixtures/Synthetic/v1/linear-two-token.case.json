@@ -1,0 +1,78 @@
+{
+  "format": "penumbra-expression-case",
+  "schemaVersion": 1,
+  "corpusVersion": "phase-5.5-v1",
+  "caseRevision": 1,
+  "caseId": "synthetic-linear-001",
+  "partition": "development",
+  "capture": {
+    "source": "synthetic",
+    "dataClassification": "publicSynthetic",
+    "writerId": "synthetic-writer",
+    "sessionId": "synthetic-session-001",
+    "deviceClass": "synthetic",
+    "pressureMode": "normalized",
+    "captureApi": "handAuthored",
+    "captureBuild": "synthetic-v1",
+    "consent": null
+  },
+  "strokes": [
+    {
+      "strokeId": "stroke-a",
+      "startOffsetTicks": null,
+      "samples": [
+        { "x": 0, "y": 0, "elapsedTicks": 0, "pressure": 0.5 },
+        { "x": 10, "y": 10, "elapsedTicks": 10, "pressure": 0.6 }
+      ]
+    },
+    {
+      "strokeId": "stroke-b",
+      "startOffsetTicks": null,
+      "samples": [
+        { "x": 20, "y": 0, "elapsedTicks": 0, "pressure": 0.5 },
+        { "x": 30, "y": 10, "elapsedTicks": 10, "pressure": 0.6 }
+      ]
+    }
+  ],
+  "initialStrokeIds": ["stroke-a", "stroke-b"],
+  "steps": [
+    {
+      "kind": "recognize",
+      "stepId": "recognize-1",
+      "expected": {
+        "regions": [
+          {
+            "regionKey": "region-1",
+            "strokeIds": ["stroke-a", "stroke-b"],
+            "bounds": { "x": 0, "y": 0, "width": 30, "height": 10 },
+            "boundsTolerance": 0.01,
+            "expectation": {
+              "outcome": "accepted",
+              "latex": "1+",
+              "tokens": [
+                { "tokenId": "token-a", "latex": "1", "sourceStrokeIds": ["stroke-a"] },
+                { "tokenId": "token-b", "latex": "+", "sourceStrokeIds": ["stroke-b"] }
+              ],
+              "layout": {
+                "kind": "sequence",
+                "ownedTokenIds": [],
+                "children": [
+                  {
+                    "role": "item",
+                    "node": { "kind": "token", "ownedTokenIds": ["token-a"], "children": [] }
+                  },
+                  {
+                    "role": "item",
+                    "node": { "kind": "token", "ownedTokenIds": ["token-b"], "children": [] }
+                  }
+                ]
+              },
+              "cas": null
+            }
+          }
+        ],
+        "sheet": null
+      }
+    }
+  ]
+}

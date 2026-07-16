@@ -1,0 +1,33 @@
+<UserControl xmlns="https://github.com/avaloniaui"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:vm="using:Penumbra.App.ViewModels"
+             xmlns:scottplot="clr-namespace:ScottPlot.Avalonia;assembly=ScottPlot.Avalonia"
+             x:Class="Penumbra.App.Views.GraphPanelView"
+             x:DataType="vm:GraphPanelViewModel"
+             IsVisible="{Binding HasCurves}">
+
+    <Border Background="#FFFFFF"
+            BorderBrush="#E2E6EC"
+            BorderThickness="1,0,0,0">
+        <DockPanel>
+            <Border DockPanel.Dock="Top"
+                    BorderBrush="#E2E6EC"
+                    BorderThickness="0,0,0,1"
+                    Padding="10,6">
+                <StackPanel Orientation="Horizontal" Spacing="8">
+                    <TextBlock Text="Graph"
+                               FontWeight="SemiBold"
+                               Foreground="#18202A"
+                               VerticalAlignment="Center"/>
+                    <TextBlock x:Name="CrosshairReadout"
+                               FontSize="12"
+                               Foreground="#5C6673"
+                               VerticalAlignment="Center"/>
+                </StackPanel>
+            </Border>
+
+            <scottplot:AvaPlot x:Name="Plot"/>
+        </DockPanel>
+    </Border>
+
+</UserControl>

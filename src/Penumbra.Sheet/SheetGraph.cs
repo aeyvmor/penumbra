@@ -27,13 +27,26 @@ public sealed class SheetGraph
 {
     private readonly IEvaluator _evaluator;
     private readonly IExpressionAnalyzer _analyzer;
+    private readonly ILocalMetricsSink _metricsSink;
+    private readonly TimeProvider _timeProvider;
     private readonly Dictionary<Guid, SheetNode> _nodes = new();
     private long _sequence;
 
     public SheetGraph(IEvaluator evaluator, IExpressionAnalyzer analyzer)
+        : this(evaluator, analyzer, NoOpLocalMetricsSink.Instance, TimeProvider.System)
+    {
+    }
+
+    public SheetGraph(
+        IEvaluator evaluator,
+        IExpressionAnalyzer analyzer,
+        ILocalMetricsSink metricsSink,
+        TimeProvider? timeProvider = null)
     {
         _evaluator = evaluator ?? throw new ArgumentNullException(nameof(evaluator));
         _analyzer = analyzer ?? throw new ArgumentNullException(nameof(analyzer));
+        _metricsSink = metricsSink ?? throw new ArgumentNullException(nameof(metricsSink));
+        _timeProvider = timeProvider ?? TimeProvider.System;
     }
 
     /// <summary>All nodes currently in the sheet, in no particular order.</summary>
@@ -138,8 +151,29 @@ public sealed class SheetGraph
     /// value-equality contract. <see cref="RecomputeReport.CausallyAffectedNodes"/> is broader: it also
     /// contains nodes which were recomputed but produced an equal result. Its deterministic order is
     /// the actual evaluation order, suitable for a causality ripple without replaying unchanged answers.
+    /// A completed <see cref="MetricOperation.SheetRecompute"/> observation counts this causal set, not
+    /// only the changed-result set.
     /// </remarks>
     public RecomputeReport RecomputeDetailed()
+    {
+        using MetricTimingScope timing = MetricTimingScope.Start(
+            _metricsSink,
+            MetricOperation.SheetRecompute,
+            _timeProvider);
+        try
+        {
+            RecomputeReport report = RecomputeDetailedCore();
+            timing.Complete(report.CausallyAffectedNodes.Count);
+            return report;
+        }
+        catch
+        {
+            timing.Fail();
+            throw;
+        }
+    }
+
+    private RecomputeReport RecomputeDetailedCore()
     {
         var nodes = _nodes.Values.ToList();
         var views = nodes.Select(EffectiveView.Committed).ToList();
@@ -219,8 +253,30 @@ public sealed class SheetGraph
     /// (honestly symbolic); cycle members yield a cyclic error with no evaluation; conflict losers yield
     /// a conflict error; a definition-role probed node evaluates its right-hand side only. The probe is
     /// idempotent and observationally invisible: pending dirty state is left exactly as found.
+    /// A completed <see cref="MetricOperation.TaffyProbe"/> observation counts
+    /// <see cref="SheetProbeReport.Entries"/>: every affected entry, including normal conflict/cycle
+    /// error results, rather than only values which would change.
     /// </remarks>
     public SheetProbeReport Probe(Guid nodeId, string trialLatex)
+    {
+        using MetricTimingScope timing = MetricTimingScope.Start(
+            _metricsSink,
+            MetricOperation.TaffyProbe,
+            _timeProvider);
+        try
+        {
+            SheetProbeReport report = ProbeCore(nodeId, trialLatex);
+            timing.Complete(report.Entries.Count);
+            return report;
+        }
+        catch
+        {
+            timing.Fail();
+            throw;
+        }
+    }
+
+    private SheetProbeReport ProbeCore(Guid nodeId, string trialLatex)
     {
         if (!_nodes.TryGetValue(nodeId, out _))
         {

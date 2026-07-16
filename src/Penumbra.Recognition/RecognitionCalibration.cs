@@ -85,4 +85,50 @@ public sealed record RecognitionCalibration(
 
         return (best, confidence, energy, rejected);
     }
+
+    /// <summary>
+    /// Every class ranked by calibrated softmax confidence, winner first. Independent of
+    /// <see cref="Apply"/> — added for Phase 5.5's spatial-grammar alternatives (audit-safe top-k
+    /// exposure, no retraining) — so it can never perturb <see cref="Apply"/>'s top-1/energy/rejected
+    /// bit-identical contract; it merely recomputes the same temperature-scaled softmax over every class
+    /// instead of only the argmax.
+    /// </summary>
+    public IReadOnlyList<(int Index, double Confidence)> RankedConfidences(IReadOnlyList<float> logits)
+    {
+        ArgumentNullException.ThrowIfNull(logits);
+        int n = logits.Count;
+        if (n == 0)
+        {
+            return Array.Empty<(int, double)>();
+        }
+
+        double t = Temperature > 0 ? Temperature : 1.0;
+
+        float zBest = float.NegativeInfinity;
+        for (int i = 0; i < n; i++)
+        {
+            float z = (float)(logits[i] / t);
+            if (z > zBest)
+            {
+                zBest = z;
+            }
+        }
+
+        var scaled = new double[n];
+        double sumExp = 0;
+        for (int i = 0; i < n; i++)
+        {
+            scaled[i] = Math.Exp((float)(logits[i] / t) - zBest);
+            sumExp += scaled[i];
+        }
+
+        var ranked = new (int Index, double Confidence)[n];
+        for (int i = 0; i < n; i++)
+        {
+            ranked[i] = (i, (float)(scaled[i] / sumExp));
+        }
+
+        Array.Sort(ranked, (a, b) => b.Confidence.CompareTo(a.Confidence));
+        return ranked;
+    }
 }

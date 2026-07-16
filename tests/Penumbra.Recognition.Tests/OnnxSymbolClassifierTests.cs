@@ -19,6 +19,25 @@ public sealed class OnnxSymbolClassifierTests
     private static string ModelDir => Path.Combine(AppContext.BaseDirectory, "Models");
 
     [Fact]
+    public void ParityFixture_ContainsOnlyProvenanceSafeSyntheticGeometry()
+    {
+        string json = File.ReadAllText(Path.Combine(AppContext.BaseDirectory, "parity_fixture.json"));
+        using JsonDocument fixture = JsonDocument.Parse(json);
+        JsonElement root = fixture.RootElement;
+
+        Assert.StartsWith("synthetic parametric geometry", root.GetProperty("provenance").GetString());
+        Assert.All(root.GetProperty("samples").EnumerateArray(), sample =>
+        {
+            string label = sample.GetProperty("label").GetString()!;
+            Assert.True(
+                label.StartsWith("synthetic_", StringComparison.Ordinal)
+                || label.StartsWith("__degenerate_", StringComparison.Ordinal)
+                || label.StartsWith("__junk_synthetic_", StringComparison.Ordinal),
+                $"fixture sample '{label}' has no synthetic provenance marker");
+        });
+    }
+
+    [Fact]
     public void FullChain_StrokesToCalibratedScores_MatchesPythonFixture()
     {
         string json = File.ReadAllText(Path.Combine(AppContext.BaseDirectory, "parity_fixture.json"));
@@ -48,6 +67,7 @@ public sealed class OnnxSymbolClassifierTests
         using var session = new InferenceSession(Path.Combine(ModelDir, "crohme_geo_cnn.onnx"));
 
         int checkedSamples = 0;
+        var coveredOutputs = new HashSet<int>();
         foreach (JsonElement sample in root.GetProperty("samples").EnumerateArray())
         {
             string label = sample.GetProperty("label").GetString()!;
@@ -105,6 +125,7 @@ public sealed class OnnxSymbolClassifierTests
             // 4) argmax — only asserted when the fixture's top-2 margin exceeds the score tolerance,
             // else a genuine near-tie (degenerate/junk ink) could flip on 1e-4 noise and mean nothing.
             int expectedIndex = sample.GetProperty("expected_index").GetInt32();
+            coveredOutputs.Add(expectedIndex);
             double margin = expectedScores.Max()
                 - expectedScores.Where((_, i) => i != Array.IndexOf(expectedScores, expectedScores.Max())).Max();
             if (margin > 1e-2)
@@ -123,6 +144,7 @@ public sealed class OnnxSymbolClassifierTests
         }
 
         Assert.True(checkedSamples >= 150, $"fixture unexpectedly small: {checkedSamples} samples");
+        Assert.Equal(classes.Length, coveredOutputs.Count);
     }
 
     [Fact]
@@ -154,6 +176,79 @@ public sealed class OnnxSymbolClassifierTests
 
         Assert.Equal("+", prediction.Label);
         Assert.True(prediction.Confidence > 0.5, $"confidence was {prediction.Confidence}");
+    }
+
+    /// <summary>
+    /// Phase 5.5 slice 4 (Section A) regression: <see cref="SymbolPrediction.Alternatives"/> is filled from
+    /// an INDEPENDENT <see cref="RecognitionCalibration.RankedConfidences"/> call, never touching the
+    /// <see cref="RecognitionCalibration.Apply"/> code path that decides Label/Confidence/Energy/Rejected.
+    /// This proves it end-to-end on the same parity fixture <see cref="FullChain_StrokesToCalibratedScores_MatchesPythonFixture"/>
+    /// already validates: top-1 must still match the Python-computed confidence/energy exactly, and the
+    /// alternatives list's own winner must agree with the top-1 field precisely (not just approximately).
+    /// </summary>
+    [Fact]
+    public void Alternatives_DoNotChangeTop1_AndTopEntryMatchesPrediction()
+    {
+        string json = File.ReadAllText(Path.Combine(AppContext.BaseDirectory, "parity_fixture.json"));
+        using JsonDocument fixture = JsonDocument.Parse(json);
+        JsonElement root = fixture.RootElement;
+        using var classifier = new OnnxSymbolClassifier(ModelDir);
+
+        int checkedSamples = 0;
+        foreach (JsonElement sample in root.GetProperty("samples").EnumerateArray())
+        {
+            string label = sample.GetProperty("label").GetString()!;
+            var strokes = sample.GetProperty("strokes").EnumerateArray()
+                .Select(s => new Stroke(Guid.NewGuid(), s.EnumerateArray()
+                    .Select(p => new StrokeSample(p[0].GetDouble(), p[1].GetDouble(), TimeSpan.Zero, 0.5))
+                    .ToList()))
+                .ToList();
+            JsonElement ctx = sample.GetProperty("context");
+            var context = new SymbolContext(
+                ctx.GetProperty("ref_h").GetDouble(),
+                ctx.GetProperty("expr_ymin").GetDouble(),
+                ctx.GetProperty("expr_h").GetDouble());
+
+            double expectedConfidence = sample.GetProperty("confidence").GetDouble();
+            double expectedEnergy = sample.GetProperty("energy").GetDouble();
+
+            SymbolPrediction prediction = classifier.Classify(strokes, context);
+
+            Assert.True(Math.Abs(prediction.Confidence - expectedConfidence) < 1e-3,
+                $"{label}: confidence C#={prediction.Confidence} Python={expectedConfidence}");
+            Assert.True(Math.Abs(prediction.Energy - expectedEnergy) < 1e-3,
+                $"{label}: energy C#={prediction.Energy} Python={expectedEnergy}");
+
+            Assert.NotNull(prediction.Alternatives);
+            Assert.NotEmpty(prediction.Alternatives!);
+            Assert.True(prediction.Alternatives!.Count <= 5);
+            Assert.Equal(prediction.Label, prediction.Alternatives[0].Label);
+            Assert.Equal(prediction.Confidence, prediction.Alternatives[0].Confidence, 9);
+
+            for (int i = 1; i < prediction.Alternatives.Count; i++)
+            {
+                Assert.True(
+                    prediction.Alternatives[i - 1].Confidence >= prediction.Alternatives[i].Confidence,
+                    $"{label}: alternatives not ranked descending at index {i}");
+            }
+
+            checkedSamples++;
+        }
+
+        Assert.True(checkedSamples >= 150, $"fixture unexpectedly small: {checkedSamples} samples");
+    }
+
+    /// <summary>
+    /// Test fakes across the codebase construct <c>SymbolPrediction</c> without ever setting
+    /// <c>Alternatives</c>. Confirms the field defaults null so every pre-existing construction site keeps
+    /// compiling and behaving unchanged.
+    /// </summary>
+    [Fact]
+    public void SymbolPrediction_Alternatives_DefaultsToNull()
+    {
+        var prediction = new SymbolPrediction("x", 0.9);
+
+        Assert.Null(prediction.Alternatives);
     }
 
     [Fact]

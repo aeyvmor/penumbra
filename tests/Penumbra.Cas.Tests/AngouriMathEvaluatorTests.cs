@@ -103,6 +103,51 @@ public sealed class AngouriMathEvaluatorTests
         Assert.Equal("False", result.DisplayText);
     }
 
+    [Theory]
+    [InlineData(@"2\lt3=", "True")]
+    [InlineData(@"2\leq2=", "True")]
+    [InlineData(@"3\geq4=", "False")]
+    [InlineData(@"2\neq3=", "True")]
+    [InlineData("2!=3=", "True")]
+    public void ModelEmittedRelationsAreEvaluatedAsBooleans(string latex, string expected)
+    {
+        // R1 emits LaTeX control words for these relations. If translation falls through to the
+        // command-as-variable path, "2\\lt3" becomes the plausible symbolic product 2*lt*3.
+        var result = Eval(latex);
+
+        Assert.True(result.IsComputed);
+        Assert.Equal(expected, result.DisplayText);
+        Assert.Equal(EvaluationKind.Boolean, result.Kind);
+    }
+
+    [Fact]
+    public void RelationWithAnUnknownStaysSymbolicUntilTheVariableIsBound()
+    {
+        var unbound = Eval(@"x\lt3=");
+        var bound = Eval(@"x\lt3=", new Dictionary<string, string> { ["x"] = "2" });
+
+        Assert.True(unbound.IsComputed);
+        Assert.Equal(EvaluationKind.Symbolic, unbound.Kind);
+        Assert.Equal(EvaluationKind.Boolean, bound.Kind);
+        Assert.Equal("True", bound.DisplayText);
+    }
+
+    [Theory]
+    [InlineData("3! = 5", "False", EvaluationKind.Boolean)]
+    [InlineData("3!=5", "True", EvaluationKind.Boolean)]
+    [InlineData("3! =", "6", EvaluationKind.Number)]
+    public void FactorialEqualityAndAdjacentNotEqualRemainDistinct(
+        string latex,
+        string expected,
+        EvaluationKind expectedKind)
+    {
+        var result = Eval(latex);
+
+        Assert.True(result.IsComputed);
+        Assert.Equal(expected, result.DisplayText);
+        Assert.Equal(expectedKind, result.Kind);
+    }
+
     [Fact]
     public void SubstitutesBoundVariableThenEvaluates()
     {

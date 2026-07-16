@@ -13,4 +13,14 @@
     <Product>Penumbra</Product>
     <Company>Penumbra</Company>
   </PropertyGroup>
+
+  <!-- Release binaries ship publicly: strip the private workspace path from every embedded
+       CodeView/PDB/exception-source string. Debug keeps real paths for local debugging. -->
+  <PropertyGroup Condition="'$(Configuration)' == 'Release'">
+    <PathMap>$(MSBuildThisFileDirectory)=/penumbra/</PathMap>
+    <Deterministic>true</Deterministic>
+    <!-- Embed the PDB: the CodeView debug-directory entry otherwise stores the absolute private
+         obj\ path to the .pdb, and Avalonia's XAML repack rewrites it outside PathMap's reach. -->
+    <DebugType>embedded</DebugType>
+  </PropertyGroup>
 </Project>

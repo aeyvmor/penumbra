@@ -70,7 +70,10 @@ public sealed class AnswerDragCompletedEventArgs(
 
 /// <summary>One accepted line's grabbable numeric literals (Phase 5.3 interaction layer).</summary>
 /// <param name="OwnerId">The recognition-region / Sheet node the runs belong to.</param>
-/// <param name="Runs">The literal runs <see cref="LiteralRuns.Find"/> reported for that line's tokens.</param>
+/// <param name="Runs">
+/// The node-scoped literals discovered from the accepted layout tree, or the legacy flat-token runs only
+/// when the recognition result carries no structural opinion.
+/// </param>
 public sealed record LiteralRunOwner(Guid OwnerId, IReadOnlyList<LiteralRun> Runs);
 
 /// <summary>

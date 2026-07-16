@@ -149,6 +149,34 @@ public sealed class IncrementalRegionRecognitionTests
     }
 
     [Fact]
+    public void PersistedRefreshHint_KeepsRegionIdentityButCannotReuseCachedLabels()
+    {
+        Stroke[] strokes = [VBar(0, 0, 20), VBar(40, 0, 20)];
+        var classifier = new RecordingClassifier();
+        var recognizer = new ExpressionRecognizer(new OverlapStrokeSegmenter(), classifier);
+        RegionRecognition first = Assert.Single(recognizer.RecognizeRegions(strokes));
+        int classifiedAfterFirst = classifier.SymbolsClassified;
+        RecognizedToken[] hostileTokens = first.Result.Tokens
+            .Select(token => token with { Latex = "7" })
+            .ToArray();
+        RegionRecognition persistedHint = first with
+        {
+            Result = new RecognitionResult("77", hostileTokens, 1, 1),
+            Dirty = false,
+            RequiresAuthoritativeRecognition = true,
+        };
+
+        RegionRecognition refreshed = Assert.Single(recognizer.RecognizeRegions(strokes, [persistedHint]));
+
+        Assert.Equal(first.Region.Id, refreshed.Region.Id);
+        Assert.True(refreshed.Dirty);
+        Assert.False(refreshed.RequiresAuthoritativeRecognition);
+        Assert.Equal("xx", refreshed.Result.Latex);
+        Assert.NotSame(persistedHint.Result, refreshed.Result);
+        Assert.Equal(classifiedAfterFirst + 2, classifier.SymbolsClassified);
+    }
+
+    [Fact]
     public void RegionIdsStable_ThroughRecognizeRegions_UnderUnrelatedEdit()
     {
         var line1 = new List<Stroke> { VBar(0, 0, 20), VBar(40, 0, 20) };

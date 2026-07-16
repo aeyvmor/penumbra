@@ -174,6 +174,21 @@ public sealed class DebouncerTests
     }
 
     [Fact]
+    public void WinningSignalCarriesItsOpaqueCallbackToken()
+    {
+        var time = new FakeTimeProvider();
+        var firedTokens = new List<long>();
+        using var debouncer = new Debouncer(Quiet, token => firedTokens.Add(token), time);
+
+        debouncer.Signal(Quiet, callbackToken: 11);
+        time.Advance(TimeSpan.FromMilliseconds(400));
+        debouncer.Signal(Quiet, callbackToken: 22);
+        time.Advance(Quiet);
+
+        Assert.Equal(new long[] { 22 }, firedTokens);
+    }
+
+    [Fact]
     public void SignalWithNonPositiveOverride_IsRejected()
     {
         using var debouncer = new Debouncer(Quiet, () => { }, new FakeTimeProvider());

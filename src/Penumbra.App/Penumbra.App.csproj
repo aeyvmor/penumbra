@@ -31,6 +31,7 @@
     </PackageReference>
     <PackageReference Include="CommunityToolkit.Mvvm" Version="8.4.1" />
     <PackageReference Include="Microsoft.Extensions.DependencyInjection" Version="8.0.1" />
+    <PackageReference Include="ScottPlot.Avalonia" Version="5.1.59" />
   </ItemGroup>
 
   <ItemGroup>
@@ -39,6 +40,7 @@
     <ProjectReference Include="..\Penumbra.Cas\Penumbra.Cas.csproj" />
     <ProjectReference Include="..\Penumbra.Recognition\Penumbra.Recognition.csproj" />
     <ProjectReference Include="..\Penumbra.Graphing\Penumbra.Graphing.csproj" />
+    <ProjectReference Include="..\Penumbra.Runtime\Penumbra.Runtime.csproj" />
     <ProjectReference Include="..\Penumbra.Sheet\Penumbra.Sheet.csproj" />
   </ItemGroup>
 </Project>
