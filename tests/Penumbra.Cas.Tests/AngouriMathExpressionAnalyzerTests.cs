@@ -55,6 +55,23 @@ public sealed class AngouriMathExpressionAnalyzerTests
     }
 
     [Theory]
+    [InlineData("2x=4", "x")]
+    [InlineData(@"\frac{6}{3}x=5", "x")]
+    [InlineData("x^2=4", "x")]
+    [InlineData("x=5", null)]
+    [InlineData("x=", null)]
+    [InlineData("x+y=10", null)]
+    [InlineData("2+2=4", null)]
+    public void AdvertisesOnlySingleUnknownEquationSolutionSymbols(
+        string latex,
+        string? expectedSolvedSymbol)
+    {
+        ExpressionAnalysis analysis = _analyzer.Analyze(latex);
+
+        Assert.Equal(expectedSolvedSymbol, analysis.SolvedSymbol);
+    }
+
+    [Theory]
     // blank / whitespace / null
     [InlineData("")]
     [InlineData("   ")]

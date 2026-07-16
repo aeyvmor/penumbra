@@ -175,7 +175,15 @@ public sealed class AngouriMathEvaluator : IEvaluator
 
             var display = string.Join(" or ", validated.Select(root => $"{target} = {root.Stringize()}"));
             var latex = string.Join(@",\quad ", validated.Select(root => $"{target.Latexise()} = {root.Latexise()}"));
-            return new EvaluationResult(latex, display, IsComputed: true, EvaluationKind.Solution);
+            SolutionBinding? uniqueSolution = validated.Count == 1
+                ? new SolutionBinding(target.Name, validated[0].Latexise())
+                : null;
+            return new EvaluationResult(
+                latex,
+                display,
+                IsComputed: true,
+                EvaluationKind.Solution,
+                uniqueSolution);
         }
 
         // Non-finite solution set (rare; AngouriMath usually parameterizes an infinite family into a

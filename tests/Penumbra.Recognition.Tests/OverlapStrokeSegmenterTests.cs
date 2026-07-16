@@ -44,6 +44,68 @@ public sealed class OverlapStrokeSegmenterTests
     }
 
     [Fact]
+    public void CloseWrittenFraction_KeepsBridgeBarSeparateFromSubstantialInkOnBothSides()
+    {
+        // Real mouse handwriting commonly puts the bar within the ordinary same-symbol merge radius.
+        // The old union-find therefore collapsed numerator + bar + denominator into one high-confidence
+        // division glyph before the spatial parser could ever see a fraction.
+        Stroke numerator = Line(new[] { (40.0, 0.0), (55.0, 60.0) });
+        Stroke bar = HLine(0, 68, 100);
+        Stroke denominator = Line(new[] { (45.0, 76.0), (65.0, 136.0) });
+
+        IReadOnlyList<StrokeGroup> groups = _segmenter.Segment(new[] { numerator, bar, denominator });
+
+        Assert.Equal(3, groups.Count);
+        Assert.All(groups, group => Assert.Single(group.Strokes));
+        Assert.Same(bar, groups.Single(group => group.Strokes.Contains(bar)).Strokes.Single());
+    }
+
+    [Fact]
+    public void DivisionSign_WithSmallDots_RemainsOneSymbol()
+    {
+        Stroke topDot = BoxStroke(17, 0, 8, 8);
+        Stroke bar = HLine(0, 10, 42);
+        Stroke bottomDot = BoxStroke(17, 12, 8, 8);
+
+        IReadOnlyList<StrokeGroup> groups = _segmenter.Segment(new[] { topDot, bar, bottomDot });
+
+        Assert.Single(groups);
+        Assert.Equal(3, groups[0].Strokes.Count);
+    }
+
+    [Fact]
+    public void TwoStrokeFive_TopBarStillMergesWithBody()
+    {
+        Stroke body = Line(new[] { (4.0, 4.0), (0.0, 24.0), (30.0, 40.0) });
+        Stroke topBar = HLine(0, 0, 30);
+
+        IReadOnlyList<StrokeGroup> groups = _segmenter.Segment(new[] { body, topBar });
+
+        Assert.Single(groups);
+        Assert.Equal(2, groups[0].Strokes.Count);
+    }
+
+    [Fact]
+    public void CloseSameColumnCrossGlyphs_DoNotChainMergeAcrossRows()
+    {
+        Stroke[] upper =
+        {
+            Line(new[] { (0.0, 0.0), (40.0, 40.0) }),
+            Line(new[] { (40.0, 0.0), (0.0, 40.0) }),
+        };
+        Stroke[] lower =
+        {
+            Line(new[] { (0.0, 63.0), (40.0, 103.0) }),
+            Line(new[] { (40.0, 63.0), (0.0, 103.0) }),
+        };
+
+        IReadOnlyList<StrokeGroup> groups = _segmenter.Segment(upper.Concat(lower).ToArray());
+
+        Assert.Equal(2, groups.Count);
+        Assert.All(groups, group => Assert.Equal(2, group.Strokes.Count));
+    }
+
+    [Fact]
     public void Expression_TwoPlusTwoEquals_AreFourGroupsLeftToRight()
     {
         Stroke two1 = VLine(0, 0, 20);     // 2
@@ -87,6 +149,16 @@ public sealed class OverlapStrokeSegmenterTests
 
     private static Stroke HLine(double x0, double y, double length) =>
         Line(Enumerable.Range(0, 11).Select(i => (x0 + length * i / 10.0, y)));
+
+    private static Stroke BoxStroke(double x, double y, double width, double height) =>
+        Line(new[]
+        {
+            (x, y),
+            (x + width, y),
+            (x + width, y + height),
+            (x, y + height),
+            (x, y),
+        });
 
     private static Stroke Line(IEnumerable<(double X, double Y)> points) =>
         new(Guid.NewGuid(), points.Select(p => new StrokeSample(p.X, p.Y, TimeSpan.Zero, 0.5)).ToList());

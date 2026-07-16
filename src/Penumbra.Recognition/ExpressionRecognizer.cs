@@ -369,9 +369,6 @@ public sealed class ExpressionRecognizer : IRecognizer, IRegionRecognizer
             // disambiguation) are now a grammar decision that lives inside SpatialLayoutParser's Stage 0 —
             // it always runs and always returns a rewritten token list, whatever the structural verdict.
             var rawTokens = new List<RecognizedToken>(effectiveGroups.Count);
-            double confidenceSum = 0;
-            double minConfidence = double.PositiveInfinity;
-
             for (int i = 0; i < effectiveGroups.Count; i++)
             {
                 StrokeGroup group = effectiveGroups[i];
@@ -381,9 +378,6 @@ public sealed class ExpressionRecognizer : IRecognizer, IRegionRecognizer
                     group.Bounds,
                     predictions[i].Confidence,
                     predictions[i].Rejected));   // B4: the OOD flag rides Seam 1 so the gate can see it
-
-                confidenceSum += predictions[i].Confidence;
-                minConfidence = Math.Min(minConfidence, predictions[i].Confidence);
             }
 
             SpatialParseResult parse = SpatialLayoutParser.Parse(rawTokens, predictions);
@@ -394,6 +388,8 @@ public sealed class ExpressionRecognizer : IRecognizer, IRegionRecognizer
             string latex = parse.Outcome.IsAccepted
                 ? LayoutLatexSerializer.Serialize(parse.Outcome.Root!)
                 : TokenLatexAssembler.Assemble(parse.Tokens.Select(t => t.Latex).ToList());
+            double confidenceSum = parse.Tokens.Sum(token => token.Confidence);
+            double minConfidence = parse.Tokens.Min(token => token.Confidence);
 
             var result = new RecognitionResult(
                 latex, parse.Tokens, confidenceSum / effectiveGroups.Count, minConfidence, parse.Outcome);

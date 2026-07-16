@@ -33,6 +33,21 @@ public sealed class MainWindowViewModelTests
     }
 
     [Fact]
+    public async Task UniqueEquationSolutionMaterializesForLaterVariableQuery()
+    {
+        RegionRecognition equation = ExpressionRegion("2x=4", 0, "2", "x", "=", "4");
+        RegionRecognition query = ExpressionRegion("x=", 80, "x", "=");
+        using MainWindowViewModel vm = Create(new QueueRecognizer(new[] { equation, query }));
+        AddInk(vm, equation, query);
+
+        await vm.RecognizeNowAsync();
+
+        SheetNode queryNode = vm.SheetNodes.Single(node => node.Id == query.Region.Id);
+        Assert.Equal("2", queryNode.Result?.DisplayText);
+        Assert.Equal(query.Region.Id, Assert.Single(vm.AnswerLayer.Answers).OwnerId);
+    }
+
+    [Fact]
     public async Task DirtySourceRecomputesEqualDependentsWithoutReplayingAnswer()
     {
         var x1 = Region("x=5", y: 0);

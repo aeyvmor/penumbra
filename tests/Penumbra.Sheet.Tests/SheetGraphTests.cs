@@ -65,6 +65,111 @@ public sealed class SheetGraphTests
         Assert.Equal("x = 7", eq.Result.DisplayText);
     }
 
+    [Theory]
+    [InlineData("2x=4", "2")]
+    [InlineData(@"\frac{6}{3}x=5", "5/2")]
+    public void UniqueSingleUnknownEquationFeedsLaterVariableQuery(
+        string equation,
+        string expected)
+    {
+        SheetNode statement = _graph.Upsert(NewId(), equation);
+        SheetNode query = _graph.Upsert(NewId(), "x=");
+
+        _graph.Recompute();
+
+        Assert.Equal(NodeRole.Statement, statement.Role);
+        Assert.Equal(EvaluationKind.Solution, statement.Result?.Kind);
+        Assert.Equal(EvaluationKind.Number, query.Result?.Kind);
+        Assert.Equal(expected, query.Result?.DisplayText);
+    }
+
+    [Fact]
+    public void EditingEquationRecomputesItsDerivedVariableQuery()
+    {
+        Guid equationId = NewId();
+        _graph.Upsert(equationId, "2x=4");
+        SheetNode query = _graph.Upsert(NewId(), "x=");
+        _graph.Recompute();
+        Assert.Equal("2", query.Result?.DisplayText);
+
+        _graph.Upsert(equationId, "2x=6");
+        IReadOnlyList<SheetNode> changed = _graph.Recompute();
+
+        Assert.Equal("3", query.Result?.DisplayText);
+        Assert.Contains(query, changed);
+    }
+
+    [Fact]
+    public void MultipleRootEquationDoesNotInventOneVariableBinding()
+    {
+        _graph.Upsert(NewId(), "x^2=4");
+        SheetNode query = _graph.Upsert(NewId(), "x=");
+
+        _graph.Recompute();
+
+        Assert.Equal(EvaluationKind.Symbolic, query.Result?.Kind);
+        Assert.Equal("x", query.Result?.DisplayText);
+    }
+
+    [Fact]
+    public void MultipleEquationCandidatesDoNotSilentlyChooseOne()
+    {
+        _graph.Upsert(NewId(), "2x=4");
+        _graph.Upsert(NewId(), "3x=6");
+        SheetNode query = _graph.Upsert(NewId(), "x=");
+
+        _graph.Recompute();
+
+        Assert.Equal(EvaluationKind.Symbolic, query.Result?.Kind);
+        Assert.Equal("x", query.Result?.DisplayText);
+    }
+
+    [Fact]
+    public void ExplicitDefinitionWinsOverEquationDerivedBinding()
+    {
+        _graph.Upsert(NewId(), "2x=4");
+        _graph.Upsert(NewId(), "x=5");
+        SheetNode query = _graph.Upsert(NewId(), "x=");
+
+        _graph.Recompute();
+
+        Assert.Equal("5", query.Result?.DisplayText);
+    }
+
+    [Fact]
+    public void AddingAndRemovingSecondEquationRevokesAndRestoresDerivedBinding()
+    {
+        _graph.Upsert(NewId(), "2x=4");
+        SheetNode query = _graph.Upsert(NewId(), "x=");
+        _graph.Recompute();
+        Assert.Equal("2", query.Result?.DisplayText);
+
+        Guid secondId = NewId();
+        _graph.Upsert(secondId, "3x=6");
+        _graph.Recompute();
+        Assert.Equal(EvaluationKind.Symbolic, query.Result?.Kind);
+        Assert.Equal("x", query.Result?.DisplayText);
+
+        _graph.Remove(secondId);
+        _graph.Recompute();
+        Assert.Equal(EvaluationKind.Number, query.Result?.Kind);
+        Assert.Equal("2", query.Result?.DisplayText);
+    }
+
+    [Fact]
+    public void AddingExplicitDefinitionReplacesExistingDerivedBinding()
+    {
+        _graph.Upsert(NewId(), "2x=4");
+        SheetNode query = _graph.Upsert(NewId(), "x=");
+        _graph.Recompute();
+        Assert.Equal("2", query.Result?.DisplayText);
+
+        _graph.Upsert(NewId(), "x=5");
+        _graph.Recompute();
+
+        Assert.Equal("5", query.Result?.DisplayText);
+    }
+
     // ---- incremental recompute ---------------------------------------------------------------
 
     [Fact]

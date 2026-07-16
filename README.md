@@ -10,9 +10,9 @@ no cloud, no account, everything on your device.
 
 ## Download
 
-**Latest release:** `v0.0.4` for Windows x64.
+**Latest release:** `v0.0.5` for Windows x64.
 
-Download `Penumbra-v0.0.4-win-x64.zip` from
+Download `Penumbra-v0.0.5-win-x64.zip` from
 [Releases](https://github.com/aeyvmor/penumbra/releases/latest), unzip it, and run
 `Penumbra.App.exe`.
 
@@ -20,7 +20,7 @@ Windows may warn because this early build is not signed yet.
 
 ## What Works Today
 
-Penumbra is in active early development. The latest packaged release is v0.0.4; public `main` may
+Penumbra is in active early development. The latest packaged release is v0.0.5; public `main` may
 contain newer milestone work before it receives a release tag. Expect rough edges.
 
 - Write a single-line expression ending in `=` (for example `2+2=`, `21+7=`, `4+1-9=`) — lift the
@@ -37,6 +37,8 @@ contain newer milestone work before it receives a release tag. Expect rough edge
 - Write practical spatial math: powers, drawn fractions, square roots, brackets, functions, implicit
   products, and nested combinations are parsed into a stroke-owned layout tree. Ambiguous structures
   are refused instead of flattened into plausible-looking wrong math.
+- Solve a one-variable equation on one line and ask for it later (`2x=4`, then `x=`). Penumbra carries
+  forward only a single verified solution; it does not guess when an equation has multiple answers.
 - Write explicit functions such as `y=x`, `y=x^2`, and `y=sin(x)` to plot them in a live side panel.
   Multiple curves, pan/zoom resampling, discontinuity gaps, and a crosshair are included.
 - Penumbra passively learns your digits/operators as you use it; missing symbols fall back to the

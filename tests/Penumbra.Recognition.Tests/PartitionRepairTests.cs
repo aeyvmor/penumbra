@@ -117,6 +117,33 @@ public sealed class PartitionRepairTests
     }
 
     [Fact]
+    public void CloseStackedSameColumnGlyphs_WithoutStructuralBridge_StaySeparateRegions()
+    {
+        // User diagnostic pages often put one sample directly below the previous sample. Their clear gap
+        // can be just under the broad baseline-jitter threshold, but near-total X overlap proves these are
+        // separate rows rather than two symbols progressing left-to-right on one expression line.
+        Stroke[] upper = { Line(0, 0, 40, 40), Line(40, 0, 0, 40) };
+        Stroke[] lower = { Line(0, 63, 40, 103), Line(40, 63, 0, 103) };
+
+        InkSegmentation segmentation = _segmenter.Segment(upper.Concat(lower).ToArray());
+
+        Assert.Equal(2, segmentation.Regions.Count);
+        Assert.All(segmentation.Regions, region => Assert.Equal(2, region.StrokeIds.Count));
+    }
+
+    [Fact]
+    public void ClearSuperscriptOffsetToTheRight_RemainsWithItsBaseRegion()
+    {
+        Stroke[] baseline = { Line(0, 30, 40, 70), Line(40, 30, 0, 70) };
+        Stroke[] exponent = { Line(35, 0, 55, 20), Line(55, 0, 35, 20) };
+
+        InkSegmentation segmentation = _segmenter.Segment(baseline.Concat(exponent).ToArray());
+
+        InkRegion region = Assert.Single(segmentation.Regions);
+        Assert.Equal(4, region.StrokeIds.Count);
+    }
+
+    [Fact]
     public void StackedFraction_StableRegionId_SurvivesAnUnrelatedEditElsewhere()
     {
         // Region ids for a merged structural line must remain stable across an incremental pass, exactly
@@ -162,6 +189,26 @@ public sealed class PartitionRepairTests
     }
 
     [Fact]
+    public void CloseWrittenFraction_SeparatesBeforeClassificationAndParsesRecursively()
+    {
+        // The user-captured failure shape: both vertical gaps are inside the ordinary same-symbol merge
+        // radius, so the pre-fix segmenter sent all three strokes to the CNN as one division-like glyph.
+        Stroke numerator = Line(0, 0, 15, 60);
+        Stroke bar = Line(0, 68, 100, 68);
+        Stroke denominator = Line(40, 76, 60, 136);
+        Stroke[] ink = { numerator, bar, denominator };
+        var recognizer = new ExpressionRecognizer(
+            new OverlapStrokeSegmenter(), new FractionGeometryClassifier());
+
+        RegionRecognition region = Assert.Single(recognizer.RecognizeRegions(ink));
+
+        Assert.Equal(3, region.Region.Groups.Count);
+        Assert.True(region.Result.ParseOutcome?.IsAccepted, region.Result.ParseOutcome?.Detail);
+        Assert.Equal(@"\frac{x}{2}", region.Result.Latex);
+        Assert.Equal(3, region.Result.Tokens.Sum(token => token.SourceStrokeIds.Count));
+    }
+
+    [Fact]
     public void MultiLineDependencies_A2_B1_YAxPlusB_StayThreeRecognizedRegions()
     {
         Stroke[] line1 = SymbolsAt(y: 0, count: 3);
@@ -185,8 +232,8 @@ public sealed class PartitionRepairTests
             InkBounds bounds = SymbolPreprocessor.Bounds(strokes);
             string label = bounds.Y switch
             {
+                _ when bounds.Width >= 40 && bounds.Height <= 4 => "-",
                 >= 45 => "2",
-                >= 30 => "-",
                 _ when strokes.Count == 2 => "+",
                 _ when bounds.X < 15 => "x",
                 _ => "1",

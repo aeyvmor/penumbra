@@ -30,6 +30,18 @@ internal static class RadicalSplitHypothesis
     /// must reach — a vinculum is drawn to stretch nearly all the way across what it covers.</summary>
     private const double MinBarCoverageRatio = 0.9;
 
+    /// <summary>A genuine radical envelope has meaningful horizontal reach relative to its height; a
+    /// descending letter such as <c>y</c> can satisfy the coverage test but remains too narrow.</summary>
+    private const double MinEnvelopeWidthToHeightRatio = 0.75;
+
+    /// <summary>The radical hook must begin materially left of the covered ink. Parallel equals bars and
+    /// ordinary multi-stroke letters usually begin at the same X and are not structural envelopes.</summary>
+    private const double MinLeftLeadHeightRatio = 0.15;
+
+    /// <summary>The proposed radical subset must have real vertical body relative to the radicand; this
+    /// excludes two flat equals bars before classification spends the one bounded hypothesis.</summary>
+    private const double MinEnvelopeToRadicandHeightRatio = 0.5;
+
     /// <summary>
     /// Attempts to split <paramref name="strokes"/> into a leading "radical mark" subset and a trailing
     /// "radicand" subset. Returns false (and empty lists) when no split satisfies the envelope/coverage
@@ -66,8 +78,20 @@ internal static class RadicalSplitHypothesis
             bool startsAtOrAboveTop = leadingBounds.Y <= trailingBounds.Y + tolerance;
             bool startsAtOrLeftOfLeft = leadingBounds.X <= trailingBounds.X;
             bool spansAcrossTheRest = leadingBounds.Width >= trailingBounds.Width * MinBarCoverageRatio;
+            double envelopeHeight = Math.Max(leadingBounds.Height, 1.0);
+            bool hasEnvelopeAspect = leadingBounds.Width
+                >= envelopeHeight * MinEnvelopeWidthToHeightRatio;
+            bool hasLeftHook = trailingBounds.X - leadingBounds.X
+                >= envelopeHeight * MinLeftLeadHeightRatio;
+            bool hasVerticalBody = leadingBounds.Height
+                >= Math.Max(trailingBounds.Height, 1.0) * MinEnvelopeToRadicandHeightRatio;
 
-            if (startsAtOrAboveTop && startsAtOrLeftOfLeft && spansAcrossTheRest)
+            if (startsAtOrAboveTop
+                && startsAtOrLeftOfLeft
+                && spansAcrossTheRest
+                && hasEnvelopeAspect
+                && hasLeftHook
+                && hasVerticalBody)
             {
                 radicalStrokes = leading;
                 radicandStrokes = trailing;

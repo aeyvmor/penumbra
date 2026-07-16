@@ -13,12 +13,13 @@ public static class RecognitionPipelineFingerprint
 {
     /// <summary>
     /// The current R1 recognition contract: recursive scripts, fractions, and radicals plus linear
-    /// sequencing/products/relations/functions/brackets under <see cref="SpatialLayoutParser"/>. Bumped from
-    /// <c>r1-spatial-v1</c> because Slice 5 changes both structural acceptance and serialized LaTeX. The
-    /// grammar now REFUSES lines the old flat assembler silently accepted (unmatched brackets, raised
-    /// tokens, ambiguous function words, …) and emits tree-serialized LaTeX for accepted lines — a v1-v3
-    /// (and any prior v4) cached read cannot be trusted to reflect this contract, so it must not survive
-    /// the migration; <c>Penumbra.Runtime.PageRecognitionCache</c> reads this to invalidate stale hints.
+    /// sequencing/products/relations/functions/brackets under <see cref="SpatialLayoutParser"/>. Version 3
+    /// separates close-written fraction bars before symbol classification and resolves the model's
+    /// <c>x</c>/<c>\times</c> probability pair from expression context, then tightens fused-radical geometry
+    /// so a preceding variable or equals sign cannot consume the one structural split attempt. These changes
+    /// can alter an accepted token, its confidence, or the serialized LaTeX, so an older cached read must be
+    /// reclassified;
+    /// <c>Penumbra.Runtime.PageRecognitionCache</c> reads this to invalidate stale hints.
     /// </summary>
-    public const string Current = "r1-recursive-v1";
+    public const string Current = "r1-recursive-v3";
 }

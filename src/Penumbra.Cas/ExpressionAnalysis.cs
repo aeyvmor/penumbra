@@ -17,7 +17,13 @@ namespace Penumbra.Cas;
 /// True for a trailing-<c>=</c> compute request such as <c>2 + x =</c> (asks for a value) as opposed
 /// to a full equation <c>2x + 3 = 7</c> (asks to be solved) or a bare statement.
 /// </param>
+/// <param name="SolvedSymbol">
+/// The sole unknown of a full equation such as <c>2x = 4</c>. This advertises a possible derived value
+/// to the sheet; it is not a definition and becomes bindable only when evaluation returns one verified
+/// solution. Null for definitions, queries, constants, and equations with zero or multiple unknowns.
+/// </param>
 public sealed record ExpressionAnalysis(
     string? DefinedSymbol,
     IReadOnlySet<string> FreeVariables,
-    bool IsQuery);
+    bool IsQuery,
+    string? SolvedSymbol = null);

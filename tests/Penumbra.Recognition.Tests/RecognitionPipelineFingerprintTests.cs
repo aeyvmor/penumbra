@@ -5,10 +5,10 @@ namespace Penumbra.Recognition.Tests;
 public sealed class RecognitionPipelineFingerprintTests
 {
     [Fact]
-    public void CurrentFingerprintPinsTheRecursivePipelineContract()
+    public void CurrentFingerprintPinsTheRecognitionRepairContract()
     {
-        // Slice 5 changes refusal/acceptance and serialized LaTeX for scripts, fractions, and radicals.
-        // A Slice-4 spatial-v1 hint must therefore reclassify rather than bypass recursive ownership.
-        Assert.Equal("r1-recursive-v1", RecognitionPipelineFingerprint.Current);
+        // Close fraction grouping, contextual x/times resolution, and fused-radical disambiguation can
+        // change the accepted read. An older hint must reclassify instead of bypassing the repaired pipeline.
+        Assert.Equal("r1-recursive-v3", RecognitionPipelineFingerprint.Current);
     }
 }

@@ -45,6 +45,40 @@ public sealed class RadicalSplitHypothesisTests
     }
 
     [Fact]
+    public void FusedRadicalAfterYEquals_IgnoresEarlierYAndEqualsFalseEnvelopes()
+    {
+        // Dogfood: sqrt alone worked, but y=sqrt(9) read as y=pi. Both the two-stroke y and the stacked
+        // equals bars satisfy the old loose "leading subset spans the rest" geometry, so the one bounded
+        // probe was spent before reaching the genuine radical group.
+        Stroke[] y = { Line(2, 5, 12, 15), Line(0, 0, 16, 32) };
+        Stroke[] equals = { Line(35, 10, 55, 10), Line(35, 20, 55, 20) };
+        Stroke[] fusedRadical =
+        {
+            Line(80, 57, 100, 95),
+            Line(100, 95, 113, 29),
+            Line(113, 29, 170, 31),
+            Line(116, 40, 146, 92),
+        };
+        Stroke[] all = y.Concat(equals).Concat(fusedRadical).ToArray();
+        var groups = new[]
+        {
+            new StrokeGroup(y, SymbolPreprocessor.Bounds(y)),
+            new StrokeGroup(equals, SymbolPreprocessor.Bounds(equals)),
+            new StrokeGroup(fusedRadical, SymbolPreprocessor.Bounds(fusedRadical)),
+        };
+        var region = new InkRegion(
+            Guid.NewGuid(), all.Select(stroke => stroke.Id).ToArray(), SymbolPreprocessor.Bounds(all), groups);
+        var recognizer = new ExpressionRecognizer(
+            new OverlapStrokeSegmenter(), new PrefixedRadicalFakeClassifier());
+
+        RecognitionResult result = recognizer.RecognizeRegion(region);
+
+        Assert.True(result.ParseOutcome?.IsAccepted, result.ParseOutcome?.Detail);
+        Assert.Equal(@"y=\sqrt{9}", result.Latex);
+        Assert.Equal(all.Length, result.Tokens.Sum(token => token.SourceStrokeIds.Count));
+    }
+
+    [Fact]
     public void GeometricEnvelopeCandidate_LowConfidenceSqrtRead_FallsBackToNormalSingleSymbol()
     {
         // The two strokes' shape passes the geometric envelope/coverage test, but the classifier reads the
@@ -110,6 +144,30 @@ public sealed class RadicalSplitHypothesisTests
                 1 => new SymbolPrediction("9", 1.0),
                 _ => new SymbolPrediction("?", 0.1, Rejected: true),
             };
+    }
+
+    private sealed class PrefixedRadicalFakeClassifier : ISymbolClassifier
+    {
+        public SymbolPrediction Classify(IReadOnlyList<Stroke> strokes, SymbolContext context)
+        {
+            InkBounds bounds = SymbolPreprocessor.Bounds(strokes);
+            if (bounds.X < 30)
+            {
+                return new SymbolPrediction("y", 0.95);
+            }
+
+            if (bounds.X < 70)
+            {
+                return new SymbolPrediction("=", 0.99);
+            }
+
+            return strokes.Count switch
+            {
+                3 => new SymbolPrediction(@"\sqrt", 0.95),
+                1 => new SymbolPrediction("9", 0.99),
+                _ => new SymbolPrediction(@"\pi", 0.90),
+            };
+        }
     }
 
     // The hypothesis batch classifies the wide candidate stroke alone as a low-confidence non-sqrt label;

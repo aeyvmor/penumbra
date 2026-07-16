@@ -34,6 +34,10 @@ public sealed class SheetNode
     /// <summary>The symbol this node binds, when it is a <see cref="NodeRole.Definition"/>; else <c>null</c>.</summary>
     public string? DefinedSymbol { get; internal set; }
 
+    /// <summary>The sole unknown this statement may derive from a verified one-solution equation. This is
+    /// never an explicit definition and remains unusable when evaluation has zero or multiple roots.</summary>
+    public string? SolvedSymbol { get; internal set; }
+
     /// <summary>The symbols this node depends on (its inbound edges' variables).</summary>
     public IReadOnlySet<string> FreeVariables { get; internal set; }
 

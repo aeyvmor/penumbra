@@ -46,6 +46,14 @@ internal static class LineClustering
     /// to one line of taller ink) never trips it.</summary>
     private const double TallMarkHeightRatio = 2.0;
 
+    /// <summary>A same-column glyph begins a new row at a smaller Y-gap than the general projection cut
+    /// only when the gap is still substantial and the two boxes almost completely overlap in X. This is
+    /// the handwritten sample-list case; scripts remain attached because they are offset to the right.</summary>
+    private const double StackedRowMinimumGapRatio = 0.45;
+    private const double StackedRowMinimumXOverlapRatio = 0.8;
+    private const double StackedRowMaximumCenterOffsetRatio = 0.25;
+    private const double StackedRowMinimumHeightSimilarityRatio = 0.5;
+
     // Order boxes by vertical center, then cut a new line wherever the vertical gap down to the
     // current line's lower edge exceeds ~0.7x the page's median symbol height. The page median is a
     // stable scale (robust to one stray mark); 0.7x sits above intra-line baseline jitter yet below
@@ -75,7 +83,9 @@ internal static class LineClustering
 
         foreach (StrokeGroup group in groups.OrderBy(g => g.Bounds.Y + g.Bounds.Height / 2.0))
         {
-            if (current.Count > 0 && group.Bounds.Y - lineYMax > threshold)
+            if (current.Count > 0
+                && (group.Bounds.Y - lineYMax > threshold
+                    || StartsClearlyStackedRow(current, group, medianHeight)))
             {
                 lines.Add(current);
                 current = new List<StrokeGroup>();
@@ -88,6 +98,42 @@ internal static class LineClustering
 
         lines.Add(current);
         return lines;
+    }
+
+    private static bool StartsClearlyStackedRow(
+        IReadOnlyList<StrokeGroup> current,
+        StrokeGroup next,
+        double medianHeight)
+    {
+        double currentYMax = current.Max(group => group.Bounds.Y + group.Bounds.Height);
+        if (next.Bounds.Y - currentYMax < StackedRowMinimumGapRatio * medianHeight)
+        {
+            return false;
+        }
+
+        foreach (StrokeGroup above in current)
+        {
+            double shorterHeight = Math.Min(above.Bounds.Height, next.Bounds.Height);
+            double tallerHeight = Math.Max(above.Bounds.Height, next.Bounds.Height);
+            if (tallerHeight <= 0
+                || shorterHeight / tallerHeight < StackedRowMinimumHeightSimilarityRatio
+                || XOverlapRatio(above.Bounds, next.Bounds) < StackedRowMinimumXOverlapRatio)
+            {
+                continue;
+            }
+
+            double aboveCenter = above.Bounds.X + above.Bounds.Width / 2.0;
+            double nextCenter = next.Bounds.X + next.Bounds.Width / 2.0;
+            double width = Math.Max(above.Bounds.Width, next.Bounds.Width);
+            if (width > 0
+                && Math.Abs(aboveCenter - nextCenter)
+                    <= StackedRowMaximumCenterOffsetRatio * width)
+            {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     /// <summary>
@@ -188,8 +234,7 @@ internal static class LineClustering
     }
 
     private static bool IsBarLike(StrokeGroup group, double medianHeight) =>
-        group.Bounds.Height > 0
-        && group.Bounds.Width > group.Bounds.Height * BarAspectRatio
+        group.Bounds.Width > Math.Max(1.0, group.Bounds.Height) * BarAspectRatio
         && group.Bounds.Height <= medianHeight * BarMaxHeightRatio;
 
     private static bool LineProvidesSide(

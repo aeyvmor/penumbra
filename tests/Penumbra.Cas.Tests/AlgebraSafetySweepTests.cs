@@ -151,13 +151,19 @@ public sealed class AlgebraSafetySweepTests
     [Fact]
     public void SolvesLinearEquation()
     {
-        AssertSolutionSet(Eval("2x+5=13"), "4");
+        EvaluationResult result = Eval("2x+5=13");
+
+        AssertSolutionSet(result, "4");
+        Assert.Equal(new SolutionBinding("x", "4"), result.UniqueSolution);
     }
 
     [Fact]
     public void SolvesQuadraticWithRationalRoots()
     {
-        AssertSolutionSet(Eval("x^2-5x+6=0"), "2", "3");
+        EvaluationResult result = Eval("x^2-5x+6=0");
+
+        AssertSolutionSet(result, "2", "3");
+        Assert.Null(result.UniqueSolution);
     }
 
     [Fact]

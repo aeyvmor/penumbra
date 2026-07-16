@@ -20,11 +20,15 @@ public sealed record SpatialParseResult(LayoutParseOutcome Outcome, IReadOnlyLis
 /// </para>
 /// <list type="number">
 ///   <item>
-///   <b>Contextual rewrite.</b> Unconditional <c>| → 1</c> and the old digit-flanked <c>x → \times</c> rule
-///   move here byte-for-byte from the pre-Phase-5.5 recognizer. Alternatives-based <c>0/o</c> and
+///   <b>Contextual rewrite.</b> Unconditional <c>| → 1</c> and alternatives-based disambiguation for
+///   <c>x/\times</c>, <c>0/o</c>, and
 ///   <c>1/l</c> disambiguation — geometry (digit vs. letter neighbours, by ORIGINAL pre-rewrite labels, so a
 ///   rewrite never cascades into the next symbol's context) picks a preferred reading; the classifier's
-///   ranked alternatives supply the competing confidence. A close-margin near-tie with NEUTRAL geometry
+///   ranked alternatives supply the competing confidence. A cross between two baseline digits is
+///   multiplication; one without the operands required by a binary operator is the variable <c>x</c>;
+///   otherwise the model's top choice is preserved. When the pair exists, its combined probability becomes
+///   the resolved token confidence, while an OOD/rejected prediction remains rejected. A close-margin
+///   near-tie with NEUTRAL geometry
 ///   (no digit or letter neighbour either side) refuses the whole line <see cref="ParseRefusalReason.LowMargin"/>
 ///   rather than silently guessing; this stage always still returns a best-effort rewritten token list even
 ///   when it refuses, so Seam-1/UI/gate consumers see the same tokens they always would have.
@@ -251,6 +255,7 @@ public static class SpatialLayoutParser
         }
 
         var finalLabels = (string[])originalLabels.Clone();
+        var finalConfidences = tokens.Select(token => token.Confidence).ToArray();
         bool ambiguous = false;
 
         for (int i = 0; i < n; i++)
@@ -264,16 +269,26 @@ public static class SpatialLayoutParser
                 continue;
             }
 
-            // Structural (unchanged from the pre-Phase-5.5 recognizer, now geometry-guarded): 'x' strictly
-            // between two SAME-BASELINE digits is the multiplication cross, not the variable. A digit that
-            // is actually a raised/lowered script (e.g. the exponent in "2x^2") must not count as a flanking
-            // digit for this rule — "2x^2" is a coefficient times a scripted variable, not "2×2".
-            if (label == "x" && i > 0 && i < n - 1 && IsAsciiDigit(originalLabels[i - 1]) && IsAsciiDigit(originalLabels[i + 1])
-                && !IsOffBaseline(tokens[i].Bounds, tokens[i - 1].Bounds)
-                && !IsOffBaseline(tokens[i].Bounds, tokens[i + 1].Bounds))
+            // x and the multiplication cross are the same two-stroke shape for many writers. Resolve only
+            // decisive grammar slots: digit-cross-digit is multiplication, while a cross missing either
+            // operand required by a binary operator is the variable x. Raised digits do not count as
+            // same-baseline neighbours, so 2x^2 remains a coefficient and scripted variable.
+            if (label is "x" or @"\times")
             {
-                finalLabels[i] = @"\times";
-                continue;
+                string? resolved = ResolveCrossMeaning(originalLabels, tokens, i);
+                if (resolved is not null)
+                {
+                    finalLabels[i] = resolved;
+                    string other = label == "x" ? @"\times" : "x";
+                    SymbolAlternative? crossAlternative = FindAlternative(predictions[i].Alternatives, other);
+                    if (crossAlternative is not null)
+                    {
+                        finalConfidences[i] = Math.Min(
+                            1.0,
+                            predictions[i].Confidence + crossAlternative.Value.Confidence);
+                    }
+                    continue;
+                }
             }
 
             string? pairOther = ConfusionPairOther(label);
@@ -324,8 +339,13 @@ public static class SpatialLayoutParser
         for (int i = 0; i < n; i++)
         {
             rewritten[i] = finalLabels[i] == originalLabels[i]
+                && finalConfidences[i] == tokens[i].Confidence
                 ? tokens[i]
-                : tokens[i] with { Latex = finalLabels[i] };
+                : tokens[i] with
+                {
+                    Latex = finalLabels[i],
+                    Confidence = finalConfidences[i],
+                };
         }
 
         return (rewritten, ambiguous);
@@ -382,6 +402,37 @@ public static class SpatialLayoutParser
     }
 
     private static bool IsAsciiDigit(string label) => label.Length == 1 && char.IsAsciiDigit(label[0]);
+
+    private static string? ResolveCrossMeaning(
+        IReadOnlyList<string> labels,
+        IReadOnlyList<RecognizedToken> tokens,
+        int index)
+    {
+        bool leftDigit = index > 0
+            && IsAsciiDigit(labels[index - 1])
+            && !IsOffBaseline(tokens[index].Bounds, tokens[index - 1].Bounds);
+        bool rightDigit = index + 1 < labels.Count
+            && IsAsciiDigit(labels[index + 1])
+            && !IsOffBaseline(tokens[index].Bounds, tokens[index + 1].Bounds);
+        if (leftDigit && rightDigit)
+        {
+            return @"\times";
+        }
+
+        bool hasLeftOperand = index > 0 && CanEndOperand(labels[index - 1]);
+        bool hasRightOperand = index + 1 < labels.Count && CanStartOperand(labels[index + 1]);
+        return !hasLeftOperand || !hasRightOperand ? "x" : null;
+    }
+
+    private static bool CanEndOperand(string label) =>
+        IsAsciiDigit(label)
+        || IsLetterLike(label)
+        || label is ")" or "]";
+
+    private static bool CanStartOperand(string label) =>
+        IsAsciiDigit(label)
+        || IsLetterLike(label)
+        || label is "(" or "[" or @"\sqrt";
 
     private static bool IsLetterLike(string label) =>
         (label.Length == 1 && char.IsAsciiLetter(label[0])) || label is @"\pi" or @"\theta" or @"\alpha";
@@ -779,6 +830,13 @@ public static class SpatialLayoutParser
 
         private static bool LooksLikeUnsupportedRootIndex(RecognizedToken candidate, RecognizedToken radical)
         {
+            // A relation/operator immediately before a radical belongs to the surrounding
+            // expression (for example y = sqrt(x)); it can never be the radical's index.
+            if (IsScriptExempt(candidate.Latex))
+            {
+                return false;
+            }
+
             double radicalMid = radical.Bounds.Y + radical.Bounds.Height / 2.0;
             bool raised = candidate.Bounds.Y + candidate.Bounds.Height < radicalMid;
             bool smaller = radical.Bounds.Height > 0

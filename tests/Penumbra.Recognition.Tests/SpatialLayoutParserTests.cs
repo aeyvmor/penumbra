@@ -852,6 +852,24 @@ public sealed class SpatialLayoutParserTests
     }
 
     [Fact]
+    public void Radical_AfterRelation_DoesNotMistakeEqualsForRootIndex()
+    {
+        RecognizedToken y = Tok("y", x: 0, width: 12, height: 20, y: 0);
+        // Deliberately small and raised enough to satisfy the root-index geometry. Its
+        // relation label must keep it in the surrounding expression instead.
+        RecognizedToken relation = Tok("=", x: 14, width: 6, height: 7, y: -8);
+        RecognizedToken sqrt = Tok(@"\sqrt", x: 19, width: 30, height: 22, y: 0);
+        RecognizedToken nine = Tok("9", x: 28, width: 10, height: 18, y: 2);
+        RecognizedToken[] tokens = { y, relation, sqrt, nine };
+        SymbolPrediction[] predictions = tokens.Select(t => Pred(t.Latex)).ToArray();
+
+        SpatialParseResult result = SpatialLayoutParser.Parse(tokens, predictions);
+
+        AssertAcceptedAndOwned(result, tokens);
+        Assert.Equal(@"y=\sqrt{9}", LayoutLatexSerializer.Serialize(result.Outcome.Root!));
+    }
+
+    [Fact]
     public void Radical_NoTokenWithinSpan_RefusesEmptyRadicalOwnership()
     {
         // The '=' sits outside the radical's horizontal reach — nothing is left to own as a radicand.
@@ -1008,7 +1026,94 @@ public sealed class SpatialLayoutParserTests
         Assert.Equal(ParseRefusalReason.UnsupportedNotation, result.Outcome.Reason);
     }
 
-    // ---- alternatives-based 0/o and 1/l contextual disambiguation ----------------------------------------
+    // ---- alternatives-based cross, 0/o, and 1/l contextual disambiguation --------------------------------
+
+    [Fact]
+    public void CrossConfusion_IsolatedTimesTopOne_RewritesToVariableAndCombinesPairConfidence()
+    {
+        RecognizedToken[] tokens = { Tok(@"\times", x: 0, confidence: 0.60) };
+        SymbolPrediction[] predictions =
+        {
+            Pred(@"\times", confidence: 0.60, alternatives: new[] { new SymbolAlternative("x", 0.399) }),
+        };
+
+        SpatialParseResult result = SpatialLayoutParser.Parse(tokens, predictions);
+
+        AssertAcceptedAndOwned(result, tokens);
+        Assert.Equal("x", result.Tokens[0].Latex);
+        Assert.Equal(0.999, result.Tokens[0].Confidence, 6);
+        Assert.Equal("x", LayoutLatexSerializer.Serialize(result.Outcome.Root!));
+    }
+
+    [Fact]
+    public void CrossConfusion_WeakXTopOneInVariableSlot_UsesResolvedPairConfidence()
+    {
+        RecognizedToken[] tokens = { Tok("x", x: 0, confidence: 0.492) };
+        SymbolPrediction[] predictions =
+        {
+            Pred("x", confidence: 0.492, alternatives: new[] { new SymbolAlternative(@"\times", 0.491) }),
+        };
+
+        SpatialParseResult result = SpatialLayoutParser.Parse(tokens, predictions);
+
+        AssertAcceptedAndOwned(result, tokens);
+        Assert.Equal("x", result.Tokens[0].Latex);
+        Assert.Equal(0.983, result.Tokens[0].Confidence, 6);
+    }
+
+    [Fact]
+    public void CrossConfusion_TimesTopOneBeforePlus_RewritesToCoefficientVariable()
+    {
+        (RecognizedToken[] tokens, SymbolPrediction[] predictions) = new LineBuilder()
+            .Add("2")
+            .Add(@"\times", confidence: 0.70,
+                alternatives: new[] { new SymbolAlternative("x", 0.295) })
+            .Add("+")
+            .Add("5")
+            .Build();
+
+        SpatialParseResult result = SpatialLayoutParser.Parse(tokens, predictions);
+
+        AssertAcceptedAndOwned(result, tokens);
+        Assert.Equal("x", result.Tokens[1].Latex);
+        Assert.Equal("2x+5", LayoutLatexSerializer.Serialize(result.Outcome.Root!));
+    }
+
+    [Fact]
+    public void CrossConfusion_BetweenDigits_RemainsMultiplicationAndCombinesPairConfidence()
+    {
+        (RecognizedToken[] tokens, SymbolPrediction[] predictions) = new LineBuilder()
+            .Add("2")
+            .Add("x", confidence: 0.55,
+                alternatives: new[] { new SymbolAlternative(@"\times", 0.44) })
+            .Add("3")
+            .Build();
+
+        SpatialParseResult result = SpatialLayoutParser.Parse(tokens, predictions);
+
+        AssertAcceptedAndOwned(result, tokens);
+        Assert.Equal(@"\times", result.Tokens[1].Latex);
+        Assert.Equal(0.99, result.Tokens[1].Confidence, 6);
+        Assert.Equal(@"2\times 3", LayoutLatexSerializer.Serialize(result.Outcome.Root!));
+    }
+
+    [Fact]
+    public void CrossConfusion_ValidExplicitProductWithVariableRight_PreservesTimesTopOne()
+    {
+        (RecognizedToken[] tokens, SymbolPrediction[] predictions) = new LineBuilder()
+            .Add("2")
+            .Add(@"\times", confidence: 0.70,
+                alternatives: new[] { new SymbolAlternative("x", 0.295) })
+            .Add("y")
+            .Build();
+
+        SpatialParseResult result = SpatialLayoutParser.Parse(tokens, predictions);
+
+        AssertAcceptedAndOwned(result, tokens);
+        Assert.Equal(@"\times", result.Tokens[1].Latex);
+        Assert.Equal(0.70, result.Tokens[1].Confidence, 6);
+        Assert.Equal(@"2\times y", LayoutLatexSerializer.Serialize(result.Outcome.Root!));
+    }
 
     [Fact]
     public void ZeroOhConfusion_DigitContextWithCloseMargin_RewritesToZero()

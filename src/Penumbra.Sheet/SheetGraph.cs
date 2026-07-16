@@ -14,7 +14,9 @@ namespace Penumbra.Sheet;
 /// Semantics (kickoff decision 4): a dependency <b>cycle</b> gives every member an
 /// <see cref="EvaluationKind.Error"/> result with no partial evaluation; <b>duplicate definitions</b> of
 /// one symbol keep the topmost-by-region-y winner (first-inserted when regions are absent) and flag the
-/// rest as <see cref="SheetNode.IsConflict"/>.
+/// rest as <see cref="SheetNode.IsConflict"/>. A full equation with one unknown may provide that symbol
+/// downstream only when it evaluates to one verified solution; multiple equation candidates provide no
+/// inferred owner, and any explicit definition wins.
 /// <para>
 /// The resolve/edge/cycle/order phases are factored into pure functions over a per-node
 /// <see cref="EffectiveView"/> that return scratch structures without writing to any node.
@@ -77,6 +79,7 @@ public sealed class SheetGraph
 
         var analysis = _analyzer.Analyze(latex);
         var oldSymbol = node.DefinedSymbol;
+        var oldSolvedSymbol = node.SolvedSymbol;
         var latexChanged = !exists || !string.Equals(node.Latex, latex, StringComparison.Ordinal);
         var regionChanged = !exists || node.Region != region;
 
@@ -84,6 +87,7 @@ public sealed class SheetGraph
         node.Tokens = tokens ?? Array.Empty<RecognizedToken>();
         node.Region = region;
         node.DefinedSymbol = analysis.DefinedSymbol;
+        node.SolvedSymbol = analysis.SolvedSymbol;
         node.FreeVariables = analysis.FreeVariables;
         node.Role = analysis.DefinedSymbol is not null
             ? NodeRole.Definition
@@ -105,9 +109,17 @@ public sealed class SheetGraph
                 }
             }
 
-            // A definition appearing/leaving/moving can change who wins a symbol, so re-check peers.
+            // A definition appearing/leaving/moving can change who wins a symbol, so re-check peers and
+            // consumers. The latter matters when a new explicit definition replaces an inferred equation.
             MarkSymbolDirty(oldSymbol, exclude: node.Id);
             MarkSymbolDirty(node.DefinedSymbol, exclude: node.Id);
+            MarkSymbolConsumersDirty(oldSymbol, exclude: node.Id);
+            MarkSymbolConsumersDirty(node.DefinedSymbol, exclude: node.Id);
+            if (!string.Equals(oldSolvedSymbol, node.SolvedSymbol, StringComparison.Ordinal))
+            {
+                MarkSymbolConsumersDirty(oldSolvedSymbol, exclude: node.Id);
+                MarkSymbolConsumersDirty(node.SolvedSymbol, exclude: node.Id);
+            }
         }
 
         return node;
@@ -131,6 +143,7 @@ public sealed class SheetGraph
         }
 
         MarkSymbolDirty(node.DefinedSymbol, exclude: id);
+        MarkSymbolConsumersDirty(node.SolvedSymbol, exclude: id);
         _nodes.Remove(id);
         return true;
     }
@@ -218,7 +231,7 @@ public sealed class SheetGraph
             affected.Add(node);
             var result = plan.Conflicts.Contains(id)
                 ? ConflictError(plan.ViewById[id].DefinedSymbol)
-                : EvaluateView(plan.ViewById[id], plan.Owners, CommittedResult);
+                : EvaluateView(plan.ViewById[id], plan.ViewById, plan.Owners, CommittedResult);
             Apply(node, result, changed);
         }
 
@@ -298,6 +311,7 @@ public sealed class SheetGraph
                 n.InsertionIndex,
                 n.Region?.Y ?? double.PositiveInfinity,
                 analysis.DefinedSymbol,
+                analysis.SolvedSymbol,
                 analysis.FreeVariables,
                 trialRole,
                 trialLatex)
@@ -349,7 +363,7 @@ public sealed class SheetGraph
             var view = trial.ViewById[id];
             var result = trial.Conflicts.Contains(id)
                 ? ConflictError(view.DefinedSymbol)
-                : EvaluateView(view, trial.Owners, ScratchFirst);
+                : EvaluateView(view, trial.ViewById, trial.Owners, ScratchFirst);
             scratch[id] = result;
             entries.Add(new ProbeEntry(_nodes[id], result));
         }
@@ -378,6 +392,7 @@ public sealed class SheetGraph
     /// </summary>
     private EvaluationResult EvaluateView(
         EffectiveView view,
+        IReadOnlyDictionary<Guid, EffectiveView> views,
         IReadOnlyDictionary<string, Guid> owners,
         Func<Guid, EvaluationResult?> resultOf)
     {
@@ -388,7 +403,17 @@ public sealed class SheetGraph
                 && ownerId != view.Id
                 && resultOf(ownerId) is { IsComputed: true } value)
             {
-                variables[symbol] = value.Latex;
+                EffectiveView owner = views[ownerId];
+                string? binding = owner.DefinedSymbol == symbol
+                    ? value.Latex
+                    : value.UniqueSolution is { } solution
+                        && solution.Symbol == symbol
+                        ? solution.Latex
+                        : null;
+                if (!string.IsNullOrWhiteSpace(binding))
+                {
+                    variables[symbol] = binding;
+                }
             }
         }
 
@@ -428,8 +453,10 @@ public sealed class SheetGraph
         return false;
     }
 
-    /// <summary>Assigns each defined symbol its winner and collects the losers. Winner: topmost by region
-    /// y; with no region, first inserted. Pure — flags nothing on the nodes.</summary>
+    /// <summary>Assigns each symbol its owner and collects losing explicit definitions. Explicit winner:
+    /// topmost by region y; with no region, first inserted. With no explicit owner, exactly one single-unknown
+    /// equation may be a derived owner; two or more candidates remain deliberately unbound. Pure — flags
+    /// nothing on the nodes.</summary>
     private static (Dictionary<string, Guid> Owners, HashSet<Guid> Conflicts) ResolveDefinitions(
         IReadOnlyList<EffectiveView> views)
     {
@@ -451,6 +478,21 @@ public sealed class SheetGraph
             }
         }
 
+        foreach (var group in views.Where(view => view.SolvedSymbol is not null)
+                     .GroupBy(view => view.SolvedSymbol!))
+        {
+            if (owners.ContainsKey(group.Key))
+            {
+                continue; // An explicit definition always outranks an inferred equation value.
+            }
+
+            EffectiveView[] candidates = group.ToArray();
+            if (candidates.Length == 1)
+            {
+                owners[group.Key] = candidates[0].Id;
+            }
+        }
+
         return (owners, conflicts);
     }
 
@@ -469,6 +511,13 @@ public sealed class SheetGraph
                 // A self-edge is kept on purpose: "a = a+1" must surface as a cycle of one.
                 if (owners.TryGetValue(symbol, out var ownerId))
                 {
+                    // A single-unknown equation produces its solved symbol; it does not consume its own
+                    // yet-unknown value. Explicit self-referencing definitions still keep the self-edge.
+                    if (ownerId == view.Id && view.SolvedSymbol == symbol)
+                    {
+                        continue;
+                    }
+
                     dependsOn[view.Id].Add(ownerId);
                 }
             }
@@ -628,6 +677,22 @@ public sealed class SheetGraph
         }
     }
 
+    private void MarkSymbolConsumersDirty(string? symbol, Guid exclude)
+    {
+        if (symbol is null)
+        {
+            return;
+        }
+
+        foreach (SheetNode node in _nodes.Values)
+        {
+            if (node.Id != exclude && node.FreeVariables.Contains(symbol))
+            {
+                node.Dirty = true;
+            }
+        }
+    }
+
     /// <summary>The part of a definition after its binding <c>=</c> — the value to evaluate.</summary>
     private static string RightHandSide(string latex)
     {
@@ -678,6 +743,7 @@ public sealed class SheetGraph
         long InsertionIndex,
         double RankY,
         string? DefinedSymbol,
+        string? SolvedSymbol,
         IReadOnlySet<string> FreeVariables,
         NodeRole Role,
         string Latex)
@@ -688,6 +754,7 @@ public sealed class SheetGraph
             node.InsertionIndex,
             node.Region?.Y ?? double.PositiveInfinity,
             node.DefinedSymbol,
+            node.SolvedSymbol,
             node.FreeVariables,
             node.Role,
             node.Latex);

@@ -16,6 +16,19 @@ namespace Penumbra.Recognition;
 /// </summary>
 public sealed class OverlapStrokeSegmenter : IStrokeSegmenter
 {
+    private const double StructuralBarAspectRatio = 3.0;
+    private const double StructuralBarMinimumWidthRatio = 0.75;
+    private const double StructuralSideOverlapRatio = 0.5;
+    private const double StructuralSideMaximumGapRatio = 1.5;
+    private const double StructuralSideMinimumReferenceExtentRatio = 0.35;
+    private const double StructuralSideMinimumBarExtentRatio = 0.25;
+    private const double ParallelBarWidthRatio = 0.75;
+    private const double ParallelBarMaximumGapRatio = 0.75;
+    private const double StackedStrokeMinimumGapRatio = 0.45;
+    private const double StackedStrokeMinimumHeightRatio = 0.5;
+    private const double StackedStrokeMinimumXOverlapRatio = 0.8;
+    private const double StackedStrokeMinimumHeightSimilarityRatio = 0.5;
+
     private readonly double _horizontalGapFactor;
     private readonly double _verticalGapFactor;
 
@@ -47,7 +60,7 @@ public sealed class OverlapStrokeSegmenter : IStrokeSegmenter
         // Only strokes that actually drew something carry spatial information.
         var items = strokes
             .Where(s => s.Samples.Count > 0)
-            .Select(s => (Stroke: s, Box: SymbolPreprocessor.Bounds(new[] { s })))
+            .Select(s => new StrokeItem(s, SymbolPreprocessor.Bounds(new[] { s })))
             .ToList();
         if (items.Count == 0)
         {
@@ -57,6 +70,7 @@ public sealed class OverlapStrokeSegmenter : IStrokeSegmenter
         double reference = ReferenceSize(items.Select(i => i.Box));
         double gapX = _horizontalGapFactor * reference;
         double gapY = _verticalGapFactor * reference;
+        IReadOnlySet<int> structuralBars = FindStructuralBars(items, reference);
 
         // Union-find: merge strokes whose boxes are within the (gapX, gapY) window of each other.
         var parent = Enumerable.Range(0, items.Count).ToArray();
@@ -75,7 +89,8 @@ public sealed class OverlapStrokeSegmenter : IStrokeSegmenter
         {
             for (int j = i + 1; j < items.Count; j++)
             {
-                if (Close(items[i].Box, items[j].Box, gapX, gapY))
+                if (Close(items[i].Box, items[j].Box, gapX, gapY)
+                    && !MustRemainSeparate(items, i, j, structuralBars, reference))
                 {
                     Union(i, j);
                 }
@@ -133,4 +148,190 @@ public sealed class OverlapStrokeSegmenter : IStrokeSegmenter
         double dy = Math.Max(0, Math.Max(a.Y, b.Y) - Math.Min(a.Y + a.Height, b.Y + b.Height));
         return dx <= gapX && dy <= gapY;
     }
+
+    // A close-written stacked fraction is the one case where the ordinary same-symbol proximity rule loses
+    // structural information: the bridge bar can touch both neighbouring glyphs and chain-union the whole
+    // fraction into one high-confidence division symbol. Preserve a bar as its own hypothesis only when it
+    // has substantial, clearly separated ink on BOTH sides. Small division dots do not meet the substantial
+    // side test; a plus has a stroke crossing the bar; '=' has a similar parallel peer; and a two-stroke 5/7
+    // has ink on only one side. Those counter-shapes must retain the original merge semantics.
+    private static IReadOnlySet<int> FindStructuralBars(IReadOnlyList<StrokeItem> items, double reference)
+    {
+        var result = new HashSet<int>();
+        for (int index = 0; index < items.Count; index++)
+        {
+            InkBounds bar = items[index].Box;
+            if (!LooksLikeBar(bar, reference))
+            {
+                continue;
+            }
+
+            var above = new List<InkBounds>();
+            var below = new List<InkBounds>();
+            bool crossingStroke = false;
+            bool parallelPeer = false;
+            double barMid = bar.Y + bar.Height / 2.0;
+            double edgeTolerance = 0.05 * reference;
+
+            for (int otherIndex = 0; otherIndex < items.Count; otherIndex++)
+            {
+                if (otherIndex == index)
+                {
+                    continue;
+                }
+
+                InkBounds other = items[otherIndex].Box;
+                if (XOverlapRatio(bar, other) < StructuralSideOverlapRatio)
+                {
+                    continue;
+                }
+
+                if (LooksLikeParallelPeer(bar, other, reference))
+                {
+                    parallelPeer = true;
+                    break;
+                }
+
+                if (other.Y < barMid && other.Y + other.Height > barMid)
+                {
+                    crossingStroke = true;
+                    break;
+                }
+
+                double aboveGap = bar.Y - (other.Y + other.Height);
+                if (other.Y + other.Height <= bar.Y + edgeTolerance
+                    && aboveGap <= StructuralSideMaximumGapRatio * reference)
+                {
+                    above.Add(other);
+                    continue;
+                }
+
+                double belowGap = other.Y - (bar.Y + bar.Height);
+                if (other.Y >= bar.Y + bar.Height - edgeTolerance
+                    && belowGap <= StructuralSideMaximumGapRatio * reference)
+                {
+                    below.Add(other);
+                }
+            }
+
+            if (!crossingStroke
+                && !parallelPeer
+                && HasSubstantialSide(above, bar, reference)
+                && HasSubstantialSide(below, bar, reference))
+            {
+                result.Add(index);
+            }
+        }
+
+        return result;
+    }
+
+    private static bool MustRemainSeparate(
+        IReadOnlyList<StrokeItem> items,
+        int first,
+        int second,
+        IReadOnlySet<int> structuralBars,
+        double reference)
+    {
+        InkBounds a = items[first].Box;
+        InkBounds b = items[second].Box;
+        if (ClearlySeparateStackedStrokes(a, b, reference))
+        {
+            return true;
+        }
+
+        if (structuralBars.Contains(first) || structuralBars.Contains(second))
+        {
+            return true;
+        }
+
+        double tolerance = 0.05 * reference;
+        foreach (int barIndex in structuralBars)
+        {
+            InkBounds bar = items[barIndex].Box;
+            bool aAbove = a.Y + a.Height <= bar.Y + tolerance;
+            bool aBelow = a.Y >= bar.Y + bar.Height - tolerance;
+            bool bAbove = b.Y + b.Height <= bar.Y + tolerance;
+            bool bBelow = b.Y >= bar.Y + bar.Height - tolerance;
+            if (((aAbove && bBelow) || (aBelow && bAbove))
+                && XOverlapRatio(bar, a) >= StructuralSideOverlapRatio
+                && XOverlapRatio(bar, b) >= StructuralSideOverlapRatio)
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    // The page-wide reference can be a little larger than two compact samples written one below the
+    // other, causing the closest diagonal strokes to chain-union both glyphs. Two substantial strokes with
+    // a real vertical gap and near-total X overlap are separate rows. Same-glyph stacked pieces (=, ÷,
+    // dotted letters, and top bars) are flat/small and deliberately fail the substantial-height guard.
+    private static bool ClearlySeparateStackedStrokes(InkBounds a, InkBounds b, double reference)
+    {
+        double gap = Math.Max(0, Math.Max(a.Y, b.Y)
+            - Math.Min(a.Y + a.Height, b.Y + b.Height));
+        double shorterHeight = Math.Min(a.Height, b.Height);
+        double tallerHeight = Math.Max(a.Height, b.Height);
+        return gap >= StackedStrokeMinimumGapRatio * reference
+            && a.Height >= StackedStrokeMinimumHeightRatio * reference
+            && b.Height >= StackedStrokeMinimumHeightRatio * reference
+            && tallerHeight > 0
+            && shorterHeight / tallerHeight >= StackedStrokeMinimumHeightSimilarityRatio
+            && XOverlapRatio(a, b) >= StackedStrokeMinimumXOverlapRatio;
+    }
+
+    private static bool LooksLikeBar(InkBounds bounds, double reference) =>
+        bounds.Width >= Math.Max(1.0, bounds.Height) * StructuralBarAspectRatio
+        && bounds.Width >= StructuralBarMinimumWidthRatio * reference;
+
+    private static bool LooksLikeParallelPeer(InkBounds bar, InkBounds other, double reference)
+    {
+        if (!LooksLikeBar(other, reference))
+        {
+            return false;
+        }
+
+        double narrower = Math.Min(bar.Width, other.Width);
+        double wider = Math.Max(bar.Width, other.Width);
+        if (wider <= 0 || narrower / wider < ParallelBarWidthRatio)
+        {
+            return false;
+        }
+
+        double gap = Math.Max(0, Math.Max(bar.Y, other.Y)
+            - Math.Min(bar.Y + bar.Height, other.Y + other.Height));
+        return gap <= ParallelBarMaximumGapRatio * reference;
+    }
+
+    private static bool HasSubstantialSide(
+        IReadOnlyList<InkBounds> side,
+        InkBounds bar,
+        double reference)
+    {
+        if (side.Count == 0)
+        {
+            return false;
+        }
+
+        double xMin = side.Min(bounds => bounds.X);
+        double yMin = side.Min(bounds => bounds.Y);
+        double xMax = side.Max(bounds => bounds.X + bounds.Width);
+        double yMax = side.Max(bounds => bounds.Y + bounds.Height);
+        double extent = Math.Max(xMax - xMin, yMax - yMin);
+        double minimum = Math.Max(
+            StructuralSideMinimumReferenceExtentRatio * reference,
+            StructuralSideMinimumBarExtentRatio * bar.Width);
+        return extent >= minimum;
+    }
+
+    private static double XOverlapRatio(InkBounds a, InkBounds b)
+    {
+        double overlap = Math.Min(a.X + a.Width, b.X + b.Width) - Math.Max(a.X, b.X);
+        double narrower = Math.Min(a.Width, b.Width);
+        return narrower <= 0 ? 0 : Math.Max(0, overlap) / narrower;
+    }
+
+    private readonly record struct StrokeItem(Stroke Stroke, InkBounds Box);
 }

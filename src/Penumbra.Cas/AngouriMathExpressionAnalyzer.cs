@@ -46,7 +46,12 @@ public sealed class AngouriMathExpressionAnalyzer : IExpressionAnalyzer
 
                 var both = VarsOf(left);
                 both.UnionWith(VarsOf(right));
-                return new ExpressionAnalysis(DefinedSymbol: null, both, IsQuery: false);
+                string? solvedSymbol = both.Count == 1 ? both.Single() : null;
+                return new ExpressionAnalysis(
+                    DefinedSymbol: null,
+                    both,
+                    IsQuery: false,
+                    SolvedSymbol: solvedSymbol);
             }
 
             // Query ("expr=") depends on the LHS variables; a bare statement ("x+1", "x+1<3") on all.

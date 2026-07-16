@@ -121,6 +121,44 @@ public sealed class DigitContextAndAssemblyTests
     }
 
     [Fact]
+    public void RealCrossAlternativePair_InVariableSlotClearsConfidenceGateAndPublishesResolvedConfidence()
+    {
+        var classifier = new PredictionScriptedClassifier(new SymbolPrediction(
+            @"\times",
+            0.492,
+            Energy: -8.0,
+            Rejected: false,
+            Alternatives: new[] { new SymbolAlternative("x", 0.491) }));
+
+        RecognitionResult result = Recognize(classifier, 1);
+        RecognitionGate.GateResult gate = RecognitionGate.Evaluate(result, threshold: 0.5924550294876099);
+
+        Assert.True(gate.Accepted);
+        Assert.Equal("x", result.Latex);
+        Assert.Equal("x", result.Tokens[0].Latex);
+        Assert.Equal(0.983, result.Tokens[0].Confidence, 6);
+        Assert.Equal(0.983, result.Confidence, 6);
+        Assert.Equal(0.983, result.MinConfidence, 6);
+    }
+
+    [Fact]
+    public void OutOfDistributionCross_IsNeverRescuedByAlternativePair()
+    {
+        var classifier = new PredictionScriptedClassifier(new SymbolPrediction(
+            @"\times",
+            0.50,
+            Energy: 1.0,
+            Rejected: true,
+            Alternatives: new[] { new SymbolAlternative("x", 0.49) }));
+
+        RecognitionResult result = Recognize(classifier, 1);
+        RecognitionGate.GateResult gate = RecognitionGate.Evaluate(result, threshold: 0.5924550294876099);
+
+        Assert.False(gate.Accepted);
+        Assert.True(result.Tokens[0].Rejected);
+    }
+
+    [Fact]
     public void BarBetweenTwoDigits_BecomesOne()
     {
         // '|' is a real class label the classifier confuses with '1'; being a digit now it
@@ -214,6 +252,14 @@ public sealed class DigitContextAndAssemblyTests
             (string label, double confidence) = _returns[_index++];
             return new SymbolPrediction(label, confidence);
         }
+    }
+
+    private sealed class PredictionScriptedClassifier(params SymbolPrediction[] returns) : ISymbolClassifier
+    {
+        private int _index;
+
+        public SymbolPrediction Classify(IReadOnlyList<Stroke> strokes, SymbolContext context) =>
+            returns[_index++];
     }
 
     private static bool IsSingleLetterOrDigit(string label) =>
